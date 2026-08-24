@@ -26,6 +26,9 @@ pub use self::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 mod connection;
 pub use self::connection::Listener;
 
+#[cfg(windows)]
+mod win32;
+
 // The frontend side of the protocol is the side that passes out the objects backing guest memory
 // and the vring notifications. On Windows those are named kernel objects created by the frontend,
 // which is QEMU, so there is no Rust frontend to support there and these modules stay POSIX only.
@@ -113,6 +116,9 @@ pub enum Error {
     FileTruncateError,
     /// memfd file seal errors
     MemFdSealError,
+    /// Failed to open a named Win32 object referenced by a message.
+    #[cfg(windows)]
+    Win32ObjectOpen(std::io::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -150,6 +156,10 @@ impl std::fmt::Display for Error {
                 f,
                 "handler failed to apply seals to memfd during get_inflight_fd"
             ),
+            #[cfg(windows)]
+            Error::Win32ObjectOpen(e) => {
+                write!(f, "failed to open a named Win32 object: {e}")
+            }
         }
     }
 }
@@ -182,6 +192,9 @@ impl Error {
             Error::FeatureMismatch => false,
             Error::ReqHandlerError(_) => false,
             Error::MemFdCreateError | Error::FileTruncateError | Error::MemFdSealError => false,
+            // The peer named an object we cannot open; reconnecting would not change that.
+            #[cfg(windows)]
+            Error::Win32ObjectOpen(_) => false,
         }
     }
 }

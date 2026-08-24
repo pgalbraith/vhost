@@ -22,6 +22,8 @@ use vm_memory::{mmap::NewBitmap, ByteValued, FileOffset, MmapRegion};
 #[cfg(feature = "xen")]
 use vm_memory::{GuestAddress, MmapRange, MmapXenFlags};
 
+#[cfg(windows)]
+use super::win32::Win32ObjectKind;
 use super::{enum_value, Error, Result};
 use crate::VringConfigData;
 
@@ -60,9 +62,24 @@ pub const VHOST_USER_CONFIG_SIZE: u32 = 0x1000;
 /// Maximum number of vrings supported.
 pub const VHOST_USER_MAX_VRINGS: u64 = 0x8000u64;
 
+/// Flag in the payload of a vring index message meaning that no descriptor is attached to it.
+pub const VHOST_USER_VRING_NOFD_MASK: u64 = 0x100;
+
 pub(super) trait Req:
     Clone + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Send + Sync + Into<u32> + TryFrom<u32>
 {
+    /// Number and kind of Win32 named-object records a request of this type carries as a trailer.
+    ///
+    /// This is the Windows counterpart of "how many descriptors does this request attach", and like
+    /// the `SCM_RIGHTS` count on POSIX it is implied by the request rather than sent on the wire.
+    /// `payload` is the message payload including the trailer; the count is always derivable from
+    /// its head. The returned kind is meaningless when the count is zero.
+    ///
+    /// See the [`win32`](super::win32) module for the wire format.
+    #[cfg(windows)]
+    fn win32_name_trailer(_code: Self, _payload: &[u8]) -> Result<(usize, Win32ObjectKind)> {
+        Ok((0, Win32ObjectKind::Section))
+    }
 }
 
 pub(super) trait MsgHeader: ByteValued + Copy + Default + VhostUserMsgValidator {
@@ -70,6 +87,23 @@ pub(super) trait MsgHeader: ByteValued + Copy + Default + VhostUserMsgValidator 
 
     /// The maximum size of a msg that can be encapsulated by this MsgHeader
     const MAX_MSG_SIZE: usize;
+
+    /// Number and kind of Win32 named-object records this message carries as a trailer.
+    ///
+    /// See [`Req::win32_name_trailer`].
+    #[cfg(windows)]
+    fn win32_name_trailer(&self, payload: &[u8]) -> Result<(usize, Win32ObjectKind)>;
+
+    /// Get the payload size recorded in the header.
+    #[cfg(windows)]
+    fn get_size(&self) -> u32;
+
+    /// Set the payload size recorded in the header.
+    ///
+    /// The Windows transport uses this to hide the name trailer from callers, so that a message is
+    /// presented exactly as a POSIX peer would have sent it.
+    #[cfg(windows)]
+    fn set_size(&mut self, size: u32);
 }
 
 enum_value! {
@@ -174,7 +208,41 @@ enum_value! {
     }
 }
 
-impl Req for FrontendReq {}
+impl Req for FrontendReq {
+    #[cfg(windows)]
+    fn win32_name_trailer(code: Self, payload: &[u8]) -> Result<(usize, Win32ObjectKind)> {
+        let head_u32 = |payload: &[u8]| -> Result<u32> {
+            let bytes = payload.get(..4).ok_or(Error::InvalidMessage)?;
+            Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+        };
+        let head_u64 = |payload: &[u8]| -> Result<u64> {
+            let bytes = payload.get(..8).ok_or(Error::InvalidMessage)?;
+            Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+        };
+
+        match code {
+            // One section object per memory region, named in the same order as the region records.
+            // The region count is at the head of the payload, and is the attached-descriptor count
+            // on POSIX too. Several regions naming the same section is normal and corresponds to
+            // several regions sharing one memfd.
+            FrontendReq::SET_MEM_TABLE => {
+                Ok((head_u32(payload)? as usize, Win32ObjectKind::Section))
+            }
+            FrontendReq::ADD_MEM_REG => Ok((1, Win32ObjectKind::Section)),
+            // A vring notification carries one event object, unless the payload says otherwise.
+            FrontendReq::SET_VRING_KICK
+            | FrontendReq::SET_VRING_CALL
+            | FrontendReq::SET_VRING_ERR => {
+                let nofd = head_u64(payload)? & VHOST_USER_VRING_NOFD_MASK != 0;
+                Ok((usize::from(!nofd), Win32ObjectKind::Event))
+            }
+            // Everything else that attaches a descriptor on POSIX belongs to a protocol feature
+            // that is not negotiated on Windows (logging, inflight tracking, the backend request
+            // channel, device state and shared objects), so no trailer is expected.
+            _ => Ok((0, Win32ObjectKind::Section)),
+        }
+    }
+}
 
 enum_value! {
     /// Type of requests sending from backends to frontends.
@@ -247,6 +315,21 @@ pub(super) struct VhostUserMsgHeader<R: Req> {
 impl<R: Req> MsgHeader for VhostUserMsgHeader<R> {
     type Request = R;
     const MAX_MSG_SIZE: usize = MAX_MSG_SIZE;
+
+    #[cfg(windows)]
+    fn win32_name_trailer(&self, payload: &[u8]) -> Result<(usize, Win32ObjectKind)> {
+        R::win32_name_trailer(self.get_code()?, payload)
+    }
+
+    #[cfg(windows)]
+    fn get_size(&self) -> u32 {
+        VhostUserMsgHeader::get_size(self)
+    }
+
+    #[cfg(windows)]
+    fn set_size(&mut self, size: u32) {
+        VhostUserMsgHeader::set_size(self, size)
+    }
 }
 
 impl<R: Req> Debug for VhostUserMsgHeader<R> {

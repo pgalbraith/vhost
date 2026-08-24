@@ -3,13 +3,15 @@
 
 //! Structs for `AF_UNIX` listener and endpoint.
 //!
-//! The control channel of a vhost-user connection is an `AF_UNIX` byte stream. How the objects the
-//! protocol hands over — the memory backing guest RAM and the vring kick/call/err notifications —
-//! travel across it is platform specific: on POSIX they are descriptors attached to a message as
-//! `SCM_RIGHTS` ancillary data.
+//! The control channel of a vhost-user connection is an `AF_UNIX` byte stream on every supported
+//! platform. What differs is how the objects the protocol needs to hand over — the memory backing
+//! guest RAM and the vring kick/call/err notifications — travel across it. On POSIX they are
+//! descriptors attached to a message as `SCM_RIGHTS` ancillary data; Windows has no equivalent, so
+//! there they are named kernel objects whose names ride along in the message payload. See the
+//! [`win32`](super::win32) module for that scheme.
 //!
-//! The platform-specific half of [`Endpoint`] therefore lives in [`unix`]; everything that does not
-//! depend on how objects are passed is shared.
+//! The platform-specific halves of [`Endpoint`] live in [`unix`] and [`windows`]; everything that
+//! does not depend on how objects are passed is shared.
 
 #![allow(dead_code)]
 
@@ -21,18 +23,27 @@ use vm_memory::ByteValued;
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 
 use super::message::*;
 use super::{Error, Result};
 
 #[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod windows;
 
 /// A raw handle on an object the protocol passes between peers.
 ///
-/// This is what the send side takes for the objects it attaches to a message.
+/// This is what the send side takes for the objects it attaches to a message. There is no Windows
+/// counterpart to descriptor passing, so on Windows nothing may be attached and the Windows
+/// [`Endpoint::send_iovec`] rejects a non-empty slice; objects are named in the payload instead.
 #[cfg(unix)]
 pub(super) type RawDescriptor = std::os::unix::io::RawFd;
+/// A raw handle on an object the protocol passes between peers.
+#[cfg(windows)]
+pub(super) type RawDescriptor = std::os::windows::io::RawHandle;
 
 /// Unix domain socket listener for accepting incoming connections.
 pub struct Listener {
@@ -108,6 +119,20 @@ impl std::os::unix::io::FromRawFd for Listener {
     }
 }
 
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for Listener {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        self.fd.as_raw_socket()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::FromRawSocket for Listener {
+    unsafe fn from_raw_socket(sock: std::os::windows::io::RawSocket) -> Self {
+        Self::from(<UnixListener as std::os::windows::io::FromRawSocket>::from_raw_socket(sock))
+    }
+}
+
 impl From<UnixListener> for Listener {
     fn from(fd: UnixListener) -> Self {
         Self { fd, path: None }
@@ -125,6 +150,12 @@ impl Drop for Listener {
 /// `AF_UNIX` socket endpoint for a vhost-user connection.
 pub(super) struct Endpoint<H: MsgHeader> {
     sock: UnixStream,
+    /// Payload of the message whose header was returned by the most recent `recv_header()`, with
+    /// the name trailer already split off. The Windows endpoint has to read a message's payload in
+    /// full before it can hand over the header, because the names of the objects the message passes
+    /// sit at the payload's end.
+    #[cfg(windows)]
+    pending: Vec<u8>,
     _h: PhantomData<H>,
 }
 
@@ -143,6 +174,8 @@ impl<H: MsgHeader> Endpoint<H> {
     pub fn from_stream(sock: UnixStream) -> Self {
         Endpoint {
             sock,
+            #[cfg(windows)]
+            pending: Vec::new(),
             _h: PhantomData,
         }
     }
