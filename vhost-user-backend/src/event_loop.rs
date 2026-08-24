@@ -6,14 +6,35 @@
 use std::fmt::{Display, Formatter};
 use std::io::{self, Result};
 use std::marker::PhantomData;
+
+#[cfg(unix)]
 use std::os::fd::IntoRawFd;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, IntoRawHandle, RawHandle};
 
 use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
-use vmm_sys_util::event::EventNotifier;
+use vmm_sys_util::event::{EventConsumer, EventNotifier};
 
 use super::backend::VhostUserBackend;
 use super::vring::VringT;
+
+/// A raw handle on an event source that can be registered with the epoll: a file descriptor on
+/// unix, a `HANDLE` on Windows.
+#[cfg(unix)]
+pub type RawDescriptor = RawFd;
+/// A raw handle on an event source that can be registered with the epoll.
+#[cfg(windows)]
+pub type RawDescriptor = RawHandle;
+
+/// Borrow `consumer`'s raw descriptor, for registering or unregistering it with the epoll.
+pub(crate) fn raw_descriptor(consumer: &EventConsumer) -> RawDescriptor {
+    #[cfg(unix)]
+    return consumer.as_raw_fd();
+    #[cfg(windows)]
+    return consumer.as_raw_handle();
+}
 
 /// Errors related to vring epoll event handling.
 #[derive(Debug)]
@@ -90,10 +111,14 @@ where
 
         let exit_event_fd = if let Some((consumer, notifier)) = exit_event_fd {
             let id = backend.num_queues();
+            #[cfg(unix)]
+            let raw = consumer.into_raw_fd();
+            #[cfg(windows)]
+            let raw = consumer.into_raw_handle();
             epoll
                 .ctl(
                     ControlOperation::Add,
-                    consumer.into_raw_fd(),
+                    raw,
                     EpollEvent::new(EventSet::IN, id as u64),
                 )
                 .map_err(VringEpollError::RegisterExitEvent)?;
@@ -116,7 +141,7 @@ where
     ///
     /// When this event is later triggered, the backend implementation of `handle_event` will be
     /// called.
-    pub fn register_listener(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
+    pub fn register_listener(&self, fd: RawDescriptor, ev_type: EventSet, data: u64) -> Result<()> {
         // `data` range [0...num_queues] is reserved for queues and exit event.
         if data <= self.backend.num_queues() as u64 {
             Err(io::Error::from_raw_os_error(libc::EINVAL))
@@ -129,7 +154,12 @@ where
     ///
     /// If the event is triggered after this function has been called, the event will be silently
     /// dropped.
-    pub fn unregister_listener(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
+    pub fn unregister_listener(
+        &self,
+        fd: RawDescriptor,
+        ev_type: EventSet,
+        data: u64,
+    ) -> Result<()> {
         // `data` range [0...num_queues] is reserved for queues and exit event.
         if data <= self.backend.num_queues() as u64 {
             Err(io::Error::from_raw_os_error(libc::EINVAL))
@@ -138,12 +168,22 @@ where
         }
     }
 
-    pub(crate) fn register_event(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
+    pub(crate) fn register_event(
+        &self,
+        fd: RawDescriptor,
+        ev_type: EventSet,
+        data: u64,
+    ) -> Result<()> {
         self.epoll
             .ctl(ControlOperation::Add, fd, EpollEvent::new(ev_type, data))
     }
 
-    pub(crate) fn unregister_event(&self, fd: RawFd, ev_type: EventSet, data: u64) -> Result<()> {
+    pub(crate) fn unregister_event(
+        &self,
+        fd: RawDescriptor,
+        ev_type: EventSet,
+        data: u64,
+    ) -> Result<()> {
         self.epoll
             .ctl(ControlOperation::Delete, fd, EpollEvent::new(ev_type, data))
     }
@@ -221,9 +261,17 @@ where
     }
 }
 
+#[cfg(unix)]
 impl<T: VhostUserBackend> AsRawFd for VringEpollHandler<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.epoll.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl<T: VhostUserBackend> AsRawHandle for VringEpollHandler<T> {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.epoll.as_raw_handle()
     }
 }
 
@@ -248,29 +296,32 @@ mod tests {
 
         let (consumer, _notifier) = new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
         handler
-            .register_listener(consumer.as_raw_fd(), EventSet::IN, 3)
+            .register_listener(raw_descriptor(&consumer), EventSet::IN, 3)
             .unwrap();
         // Register an already registered fd.
         handler
-            .register_listener(consumer.as_raw_fd(), EventSet::IN, 3)
+            .register_listener(raw_descriptor(&consumer), EventSet::IN, 3)
             .unwrap_err();
         // Register an invalid data.
         handler
-            .register_listener(consumer.as_raw_fd(), EventSet::IN, 1)
+            .register_listener(raw_descriptor(&consumer), EventSet::IN, 1)
             .unwrap_err();
 
         handler
-            .unregister_listener(consumer.as_raw_fd(), EventSet::IN, 3)
+            .unregister_listener(raw_descriptor(&consumer), EventSet::IN, 3)
             .unwrap();
         // unregister an already unregistered fd.
         handler
-            .unregister_listener(consumer.as_raw_fd(), EventSet::IN, 3)
+            .unregister_listener(raw_descriptor(&consumer), EventSet::IN, 3)
             .unwrap_err();
         // unregister an invalid data.
         handler
-            .unregister_listener(consumer.as_raw_fd(), EventSet::IN, 1)
+            .unregister_listener(raw_descriptor(&consumer), EventSet::IN, 1)
             .unwrap_err();
-        // Check we retrieve the correct file descriptor
+        // Check we retrieve the correct descriptor
+        #[cfg(unix)]
         assert_eq!(handler.as_raw_fd(), handler.epoll.as_raw_fd());
+        #[cfg(windows)]
+        assert_eq!(handler.as_raw_handle(), handler.epoll.as_raw_handle());
     }
 }

@@ -8,7 +8,10 @@
 use std::fs::File;
 use std::io;
 use std::ops::{Deref, DerefMut};
+#[cfg(unix)]
 use std::os::unix::io::{FromRawFd, IntoRawFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawHandle, IntoRawHandle};
 use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -242,7 +245,15 @@ impl<M: GuestAddressSpace> VringState<M> {
         // EventFd requires that it has sole ownership of its fd. So does File, so this is safe.
         // Ideally, we'd have a generic way to refer to a uniquely-owned fd, such as that proposed
         // by Rust RFC #3128.
-        self.kick = file.map(|f| unsafe { EventConsumer::from_raw_fd(f.into_raw_fd()) });
+        #[cfg(unix)]
+        {
+            self.kick = file.map(|f| unsafe { EventConsumer::from_raw_fd(f.into_raw_fd()) });
+        }
+        #[cfg(windows)]
+        {
+            self.kick =
+                file.map(|f| unsafe { EventConsumer::from_raw_handle(f.into_raw_handle()) });
+        }
     }
 
     /// Read event from the kick `EventFd`.
@@ -257,7 +268,15 @@ impl<M: GuestAddressSpace> VringState<M> {
     /// Set `EventFd` for call.
     fn set_call(&mut self, file: Option<File>) {
         // SAFETY: see comment in set_kick()
-        self.call = file.map(|f| unsafe { EventNotifier::from_raw_fd(f.into_raw_fd()) });
+        #[cfg(unix)]
+        {
+            self.call = file.map(|f| unsafe { EventNotifier::from_raw_fd(f.into_raw_fd()) });
+        }
+        #[cfg(windows)]
+        {
+            self.call =
+                file.map(|f| unsafe { EventNotifier::from_raw_handle(f.into_raw_handle()) });
+        }
     }
 
     /// Get the `EventFd` for call.
@@ -268,7 +287,14 @@ impl<M: GuestAddressSpace> VringState<M> {
     /// Set `EventFd` for err.
     fn set_err(&mut self, file: Option<File>) {
         // SAFETY: see comment in set_kick()
-        self.err = file.map(|f| unsafe { EventConsumer::from_raw_fd(f.into_raw_fd()) });
+        #[cfg(unix)]
+        {
+            self.err = file.map(|f| unsafe { EventConsumer::from_raw_fd(f.into_raw_fd()) });
+        }
+        #[cfg(windows)]
+        {
+            self.err = file.map(|f| unsafe { EventConsumer::from_raw_handle(f.into_raw_handle()) });
+        }
     }
 }
 
@@ -555,7 +581,10 @@ mod tests {
 
         let (consumer, notifier) = new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
         // SAFETY: Safe because we panic before if eventfd is not valid.
+        #[cfg(unix)]
         let file = unsafe { File::from_raw_fd(consumer.into_raw_fd()) };
+        #[cfg(windows)]
+        let file = unsafe { File::from_raw_handle(consumer.into_raw_handle()) };
         assert!(vring.get_mut().kick.is_none());
         assert!(vring.read_kick().unwrap());
         vring.set_kick(Some(file));
@@ -567,7 +596,10 @@ mod tests {
 
         let (_consumer, notifier) = new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
         // SAFETY: Safe because we panic before if eventfd is not valid.
+        #[cfg(unix)]
         let file = unsafe { File::from_raw_fd(notifier.into_raw_fd()) };
+        #[cfg(windows)]
+        let file = unsafe { File::from_raw_handle(notifier.into_raw_handle()) };
         assert!(vring.get_ref().call.is_none());
         vring.set_call(Some(file));
         assert!(vring.get_ref().call.is_some());
@@ -576,7 +608,10 @@ mod tests {
 
         let (consumer, _notifier) = new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
         // SAFETY: Safe because we panic before if eventfd is not valid.
+        #[cfg(unix)]
         let file = unsafe { File::from_raw_fd(consumer.into_raw_fd()) };
+        #[cfg(windows)]
+        let file = unsafe { File::from_raw_handle(consumer.into_raw_handle()) };
         assert!(vring.get_ref().err.is_none());
         vring.set_err(Some(file));
         assert!(vring.get_ref().err.is_some());

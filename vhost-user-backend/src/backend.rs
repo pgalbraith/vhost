@@ -27,11 +27,17 @@ use vhost::vhost_user::message::{
     VhostTransferStateDirection, VhostTransferStatePhase, VhostUserProtocolFeatures,
     VhostUserShMemConfig, VhostUserSharedMsg,
 };
+// `Backend` and `GpuBackend` are established by handing a socket over the vhost-user connection,
+// which the Windows transport cannot do, and both belong to protocol features the front-end masks
+// there (`BACKEND_REQ`/`BACKEND_SEND_FD` and the GPU channel). See `vhost::vhost_user`'s own
+// platform split.
+#[cfg(unix)]
 use vhost::vhost_user::Backend;
 use vm_memory::bitmap::Bitmap;
 use vmm_sys_util::epoll::EventSet;
 use vmm_sys_util::event::{EventConsumer, EventNotifier};
 
+#[cfg(unix)]
 use vhost::vhost_user::GpuBackend;
 
 use super::vring::VringT;
@@ -91,6 +97,7 @@ pub trait VhostUserBackend: Send + Sync {
     ///
     /// A default implementation is provided as we cannot expect all backends to implement this
     /// function.
+    #[cfg(unix)]
     fn set_backend_req_fd(&self, _backend: Backend) {}
 
     /// This method retrieves a file descriptor for a shared object, identified by a unique UUID,
@@ -112,6 +119,7 @@ pub trait VhostUserBackend: Send + Sync {
     ///
     /// This function returns a `Result`, returning an error if the backend does not implement this
     /// function.
+    #[cfg(unix)]
     fn set_gpu_socket(&self, _gpu_backend: GpuBackend) -> Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -241,6 +249,7 @@ pub trait VhostUserBackendMut: Send + Sync {
     ///
     /// A default implementation is provided as we cannot expect all backends to implement this
     /// function.
+    #[cfg(unix)]
     fn set_backend_req_fd(&mut self, _backend: Backend) {}
 
     /// This method retrieves a file descriptor for a shared object, identified by a unique UUID,
@@ -262,6 +271,7 @@ pub trait VhostUserBackendMut: Send + Sync {
     ///
     /// This function returns a `Result`, returning an error if the backend does not implement this
     /// function.
+    #[cfg(unix)]
     fn set_gpu_socket(&mut self, _gpu_backend: GpuBackend) -> Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -382,6 +392,7 @@ impl<T: VhostUserBackend> VhostUserBackend for Arc<T> {
         self.deref().update_memory(mem)
     }
 
+    #[cfg(unix)]
     fn set_backend_req_fd(&self, backend: Backend) {
         self.deref().set_backend_req_fd(backend)
     }
@@ -390,6 +401,7 @@ impl<T: VhostUserBackend> VhostUserBackend for Arc<T> {
         self.deref().get_shared_object(uuid)
     }
 
+    #[cfg(unix)]
     fn set_gpu_socket(&self, gpu_backend: GpuBackend) -> Result<()> {
         self.deref().set_gpu_socket(gpu_backend)
     }
@@ -475,6 +487,7 @@ impl<T: VhostUserBackendMut> VhostUserBackend for Mutex<T> {
         self.lock().unwrap().update_memory(mem)
     }
 
+    #[cfg(unix)]
     fn set_backend_req_fd(&self, backend: Backend) {
         self.lock().unwrap().set_backend_req_fd(backend)
     }
@@ -483,6 +496,7 @@ impl<T: VhostUserBackendMut> VhostUserBackend for Mutex<T> {
         self.lock().unwrap().get_shared_object(uuid)
     }
 
+    #[cfg(unix)]
     fn set_gpu_socket(&self, gpu_backend: GpuBackend) -> Result<()> {
         self.lock().unwrap().set_gpu_socket(gpu_backend)
     }
@@ -571,6 +585,7 @@ impl<T: VhostUserBackendMut> VhostUserBackend for RwLock<T> {
         self.write().unwrap().update_memory(mem)
     }
 
+    #[cfg(unix)]
     fn set_backend_req_fd(&self, backend: Backend) {
         self.write().unwrap().set_backend_req_fd(backend)
     }
@@ -579,6 +594,7 @@ impl<T: VhostUserBackendMut> VhostUserBackend for RwLock<T> {
         self.write().unwrap().get_shared_object(uuid)
     }
 
+    #[cfg(unix)]
     fn set_gpu_socket(&self, gpu_backend: GpuBackend) -> Result<()> {
         self.write().unwrap().set_gpu_socket(gpu_backend)
     }
@@ -719,6 +735,7 @@ pub mod tests {
             Ok(())
         }
 
+        #[cfg(unix)]
         fn set_backend_req_fd(&mut self, _backend: Backend) {}
 
         fn get_shared_object(&mut self, _uuid: VhostUserSharedMsg) -> Result<File> {

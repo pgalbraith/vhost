@@ -6,10 +6,8 @@
 use std::error;
 use std::fs::File;
 use std::io;
-use std::os::fd::AsFd;
 #[cfg(feature = "postcopy")]
 use std::os::fd::FromRawFd;
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::thread;
 
@@ -22,9 +20,12 @@ use vhost::vhost_user::message::{
     VhostUserSingleMemoryRegion, VhostUserVirtioFeatures, VhostUserVringAddrFlags,
     VhostUserVringState,
 };
+#[cfg(unix)]
+use vhost::vhost_user::Backend;
+#[cfg(unix)]
 use vhost::vhost_user::GpuBackend;
 use vhost::vhost_user::{
-    Backend, Error as VhostUserError, Result as VhostUserResult, VhostUserBackendReqHandlerMut,
+    Error as VhostUserError, Result as VhostUserResult, VhostUserBackendReqHandlerMut,
 };
 
 use virtio_bindings::bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -36,6 +37,7 @@ use vm_memory::{
 use vmm_sys_util::epoll::EventSet;
 
 use super::backend::VhostUserBackend;
+use super::event_loop::raw_descriptor;
 use super::event_loop::VringEpollHandler;
 use super::event_loop::{VringEpollError, VringEpollResult};
 use super::vring::VringT;
@@ -222,7 +224,7 @@ where
                     let evt_idx = queues_mask.count_ones() - shifted_queues_mask.count_ones();
                     if vring_state.get_queue().ready() && vring_state.is_enabled() {
                         if let Err(e) = self.handlers[thread_index].register_event(
-                            fd.as_raw_fd(),
+                            raw_descriptor(fd),
                             EventSet::IN,
                             u64::from(evt_idx),
                         ) {
@@ -234,7 +236,7 @@ where
                         }
                     } else {
                         let _ = self.handlers[thread_index].unregister_event(
-                            fd.as_raw_fd(),
+                            raw_descriptor(fd),
                             EventSet::IN,
                             u64::from(evt_idx),
                         );
@@ -570,6 +572,7 @@ where
             .map_err(VhostUserError::ReqHandlerError)
     }
 
+    #[cfg(unix)]
     fn set_backend_req_fd(&mut self, backend: Backend) {
         if self.acked_protocol_features & VhostUserProtocolFeatures::REPLY_ACK.bits() != 0 {
             backend.set_reply_ack_flag(true);
@@ -583,6 +586,7 @@ where
         self.backend.set_backend_req_fd(backend);
     }
 
+    #[cfg(unix)]
     fn set_gpu_socket(&mut self, gpu_backend: GpuBackend) -> VhostUserResult<()> {
         self.backend
             .set_gpu_socket(gpu_backend)
@@ -774,8 +778,15 @@ where
     fn set_log_base(&mut self, log: &VhostUserLog, file: File) -> VhostUserResult<()> {
         let mem = self.atomic_mem.memory();
 
+        #[cfg(unix)]
+        let logmem_source = {
+            use std::os::fd::AsFd;
+            file.as_fd()
+        };
+        #[cfg(windows)]
+        let logmem_source = &file;
         let logmem = Arc::new(
-            MmapLogReg::from_file(file.as_fd(), log.mmap_offset, log.mmap_size)
+            MmapLogReg::from_file(logmem_source, log.mmap_offset, log.mmap_size)
                 .map_err(VhostUserError::ReqHandlerError)?,
         );
 
@@ -816,8 +827,12 @@ impl<T: VhostUserBackend> Drop for VhostUserHandler<T> {
 mod tests {
     use super::*;
     use crate::backend::tests::MockVhostBackend;
+    #[cfg(unix)]
     use std::os::fd::IntoRawFd;
+    #[cfg(unix)]
     use std::os::unix::io::FromRawFd;
+    #[cfg(windows)]
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle};
     use std::sync::Mutex;
     use std::thread;
     use std::time::Duration;
@@ -842,7 +857,10 @@ mod tests {
         let (kick_consumer, notifier) =
             new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
         // Safety: we know kick_consumer is valid.
+        #[cfg(unix)]
         let kick_consumer_file = unsafe { File::from_raw_fd(kick_consumer.into_raw_fd()) };
+        #[cfg(windows)]
+        let kick_consumer_file = unsafe { File::from_raw_handle(kick_consumer.into_raw_handle()) };
         handler
             .set_vring_kick(vring_index as u8, Some(kick_consumer_file))
             .unwrap();

@@ -10,11 +10,14 @@ extern crate log;
 
 use std::fmt::{Display, Formatter};
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 use vhost::vhost_user::{BackendListener, BackendReqHandler, Error as VhostUserError, Listener};
 use vm_memory::mmap::NewBitmap;
@@ -331,10 +334,14 @@ impl<T: VhostUserBackend> Drop for VhostUserDaemon<T> {
 mod tests {
     use super::backend::tests::MockVhostBackend;
     use super::*;
+    #[cfg(unix)]
     use libc::EAGAIN;
+    #[cfg(unix)]
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::Barrier;
     use std::time::Duration;
+    #[cfg(windows)]
+    use uds_windows::{UnixListener, UnixStream};
     use vm_memory::{GuestAddress, GuestMemoryAtomic, GuestMemoryMmap};
 
     #[test]
@@ -426,7 +433,14 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
             }
 
-            // Check that no exit events got triggered yet
+            // Check that no exit events got triggered yet.
+            //
+            // Windows' `consume()` is intentionally lossy (see `vmm_sys_util::event`'s Windows
+            // docs): it never blocks and always returns `Ok(())`, so unlike a nonblocking read on
+            // an unsignaled Linux eventfd, there is no way to observe "not yet signaled" through
+            // this API there. Only the positive check below — that an exit event that really was
+            // raised is observable — has a Windows equivalent.
+            #[cfg(unix)]
             for thread_id in 0..backend.queues_per_thread().len() {
                 let fd = backend.exit_event(thread_id).unwrap();
                 // Reading from exit fd should fail since nothing was written yet

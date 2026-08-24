@@ -32,6 +32,9 @@ vmm-sys-util = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 vm-memory = { workspace = true, features = ["rawfd"] }
 
+[target."cfg(windows)".dependencies]
+uds_windows = "1.2.1"
+
 [dev-dependencies]
 nix = { version = "0.31", features = ["fs"] }
 uuid = { version = "1.8.0", features=["v4"] }

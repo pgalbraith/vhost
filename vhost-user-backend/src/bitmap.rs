@@ -2,11 +2,16 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(windows)]
+use std::fs::File;
+use std::io;
 use std::ops::Index;
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(unix)]
+use std::ptr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
-use std::{io, ptr};
 use vm_memory::bitmap::{Bitmap, BitmapSlice, WithBitmapSlice};
 use vm_memory::mmap::NewBitmap;
 use vm_memory::{Address, GuestMemoryRegion};
@@ -223,6 +228,13 @@ unsafe impl Send for MmapLogReg {}
 unsafe impl Sync for MmapLogReg {}
 
 impl MmapLogReg {
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+#[cfg(unix)]
+impl MmapLogReg {
     // Note: We could try to adjust the mapping area to only cover the memory region, but
     // the region's starting address is not guarantee to be LOG_WORD_SIZE-page aligned
     // which makes the implementation needlessly cumbersome.
@@ -259,9 +271,19 @@ impl MmapLogReg {
             len,
         })
     }
+}
 
-    fn len(&self) -> usize {
-        self.len
+// `VHOST_USER_PROTOCOL_F_LOG_SHMFD` is masked by the vhost-user front-end on Windows (there is no
+// named-object equivalent of the shared dirty-page log in the Windows transport), so the frontend
+// never sends `SET_LOG_BASE`, and this is never called in practice. The method still needs a body
+// to satisfy `MemRegionBitmap`, which is why this returns an error rather than being cfg'd away.
+#[cfg(windows)]
+impl MmapLogReg {
+    pub(crate) fn from_file(_file: &File, _offset: u64, _len: u64) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "dirty-page log tracking for migration is not supported on Windows",
+        ))
     }
 }
 
@@ -278,6 +300,7 @@ impl Index<usize> for MmapLogReg {
     }
 }
 
+#[cfg(unix)]
 impl Drop for MmapLogReg {
     fn drop(&mut self) {
         // SAFETY: `addr` is properly aligned, also we are sure that this is the
@@ -285,6 +308,14 @@ impl Drop for MmapLogReg {
         unsafe {
             libc::munmap(self.addr as *mut libc::c_void, self.len as libc::size_t);
         }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MmapLogReg {
+    fn drop(&mut self) {
+        // `from_file` above always errors before mapping anything on Windows, so a `MmapLogReg`
+        // here never holds a live mapping.
     }
 }
 
@@ -322,7 +353,7 @@ fn page_bit(page: usize) -> usize {
     page % LOG_WORD_SIZE
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 mod tests {
     use super::*;
     use std::fs::File;
