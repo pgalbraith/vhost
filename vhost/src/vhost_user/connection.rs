@@ -1,24 +1,38 @@
 // Copyright (C) 2019 Alibaba Cloud Computing. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Structs for Unix Domain Socket listener and endpoint.
+//! Structs for `AF_UNIX` listener and endpoint.
+//!
+//! The control channel of a vhost-user connection is an `AF_UNIX` byte stream. How the objects the
+//! protocol hands over — the memory backing guest RAM and the vring kick/call/err notifications —
+//! travel across it is platform specific: on POSIX they are descriptors attached to a message as
+//! `SCM_RIGHTS` ancillary data.
+//!
+//! The platform-specific half of [`Endpoint`] therefore lives in [`unix`]; everything that does not
+//! depend on how objects are passed is shared.
 
 #![allow(dead_code)]
 
-use std::fs::File;
-use std::io::ErrorKind;
 use std::marker::PhantomData;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::{mem, slice};
+use std::{io::ErrorKind, mem, slice};
 
-use libc::{c_void, iovec};
 use vm_memory::ByteValued;
-use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
 
 use super::message::*;
 use super::{Error, Result};
+
+#[cfg(unix)]
+mod unix;
+
+/// A raw handle on an object the protocol passes between peers.
+///
+/// This is what the send side takes for the objects it attaches to a message.
+#[cfg(unix)]
+pub(super) type RawDescriptor = std::os::unix::io::RawFd;
 
 /// Unix domain socket listener for accepting incoming connections.
 pub struct Listener {
@@ -78,15 +92,19 @@ impl Listener {
     }
 }
 
-impl AsRawFd for Listener {
-    fn as_raw_fd(&self) -> RawFd {
+#[cfg(unix)]
+impl std::os::unix::io::AsRawFd for Listener {
+    fn as_raw_fd(&self) -> RawDescriptor {
         self.fd.as_raw_fd()
     }
 }
 
-impl FromRawFd for Listener {
-    unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        Self::from(UnixListener::from_raw_fd(fd))
+#[cfg(unix)]
+impl std::os::unix::io::FromRawFd for Listener {
+    unsafe fn from_raw_fd(fd: RawDescriptor) -> Self {
+        Self::from(<UnixListener as std::os::unix::io::FromRawFd>::from_raw_fd(
+            fd,
+        ))
     }
 }
 
@@ -104,7 +122,7 @@ impl Drop for Listener {
     }
 }
 
-/// Unix domain socket endpoint for vhost-user connection.
+/// `AF_UNIX` socket endpoint for a vhost-user connection.
 pub(super) struct Endpoint<H: MsgHeader> {
     sock: UnixStream,
     _h: PhantomData<H>,
@@ -133,19 +151,6 @@ impl<H: MsgHeader> Endpoint<H> {
         self.sock.try_clone()
     }
 
-    /// Sends bytes from scatter-gather vectors over the socket with optional attached file
-    /// descriptors.
-    ///
-    /// # Return:
-    /// * - number of bytes sent on success
-    /// * - SocketRetry: temporary error caused by signals or short of resources.
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
-    pub fn send_iovec(&mut self, iovs: &[&[u8]], fds: Option<&[RawFd]>) -> Result<usize> {
-        let rfds = fds.unwrap_or_default();
-        self.sock.send_with_fds(iovs, rfds).map_err(Into::into)
-    }
-
     /// Sends all bytes from scatter-gather vectors over the socket with optional attached file
     /// descriptors. Will loop until all data has been transfered.
     ///
@@ -153,7 +158,11 @@ impl<H: MsgHeader> Endpoint<H> {
     /// * - number of bytes sent on success
     /// * - SocketBroken: the underline socket is broken.
     /// * - SocketError: other socket related errors.
-    pub fn send_iovec_all(&mut self, iovs: &[&[u8]], fds: Option<&[RawFd]>) -> Result<usize> {
+    pub fn send_iovec_all(
+        &mut self,
+        iovs: &[&[u8]],
+        fds: Option<&[RawDescriptor]>,
+    ) -> Result<usize> {
         let mut data_sent = 0;
         let mut data_total = 0;
         let iov_lens: Vec<usize> = iovs.iter().map(|iov| iov.len()).collect();
@@ -188,7 +197,7 @@ impl<H: MsgHeader> Endpoint<H> {
     /// * - SocketRetry: temporary error caused by signals or short of resources.
     /// * - SocketBroken: the underline socket is broken.
     /// * - SocketError: other socket related errors.
-    pub fn send_slice(&mut self, data: &[u8], fds: Option<&[RawFd]>) -> Result<usize> {
+    pub fn send_slice(&mut self, data: &[u8], fds: Option<&[RawDescriptor]>) -> Result<usize> {
         self.send_iovec(&[data], fds)
     }
 
@@ -200,7 +209,7 @@ impl<H: MsgHeader> Endpoint<H> {
     /// * - SocketBroken: the underline socket is broken.
     /// * - SocketError: other socket related errors.
     /// * - PartialMessage: received a partial message.
-    pub fn send_header(&mut self, hdr: &H, fds: Option<&[RawFd]>) -> Result<()> {
+    pub fn send_header(&mut self, hdr: &H, fds: Option<&[RawDescriptor]>) -> Result<()> {
         // SAFETY: Safe because there can't be other mutable referance to hdr.
         let iovs = unsafe {
             [slice::from_raw_parts(
@@ -228,7 +237,7 @@ impl<H: MsgHeader> Endpoint<H> {
         &mut self,
         hdr: &H,
         body: &T,
-        fds: Option<&[RawFd]>,
+        fds: Option<&[RawDescriptor]>,
     ) -> Result<()> {
         if mem::size_of::<T>() > H::MAX_MSG_SIZE {
             return Err(Error::OversizedMsg);
@@ -256,7 +265,7 @@ impl<H: MsgHeader> Endpoint<H> {
         hdr: &H,
         body: &T,
         payload: &[u8],
-        fds: Option<&[RawFd]>,
+        fds: Option<&[RawDescriptor]>,
     ) -> Result<()> {
         let len = payload.len();
         if mem::size_of::<T>() > H::MAX_MSG_SIZE {
@@ -277,325 +286,6 @@ impl<H: MsgHeader> Endpoint<H> {
             return Err(Error::PartialMessage);
         }
         Ok(())
-    }
-
-    /// Reads bytes from the socket into the given scatter/gather vectors.
-    ///
-    /// # Return:
-    /// * - (number of bytes received, buf) on success
-    /// * - SocketRetry: temporary error caused by signals or short of resources.
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
-    pub fn recv_data(&mut self, len: usize) -> Result<(usize, Vec<u8>)> {
-        let mut rbuf = vec![0u8; len];
-        let mut iovs = [iovec {
-            iov_base: rbuf.as_mut_ptr() as *mut c_void,
-            iov_len: len,
-        }];
-        // SAFETY: Safe because we own rbuf and it's safe to fill a byte array with arbitrary data.
-        let (bytes, _) = unsafe { self.sock.recv_with_fds(&mut iovs, &mut [])? };
-        Ok((bytes, rbuf))
-    }
-
-    /// Reads bytes from the socket into the given scatter/gather vectors with optional attached
-    /// file.
-    ///
-    /// The underlying communication channel is a Unix domain socket in STREAM mode. It's a little
-    /// tricky to pass file descriptors through such a communication channel. Let's assume that a
-    /// sender sending a message with some file descriptors attached. To successfully receive those
-    /// attached file descriptors, the receiver must obey following rules:
-    ///   1) file descriptors are attached to a message.
-    ///   2) message(packet) boundaries must be respected on the receive side.
-    ///
-    /// In other words, recvmsg() operations must not cross the packet boundary, otherwise the
-    /// attached file descriptors will get lost.
-    /// Note that this function wraps received file descriptors as `File`.
-    ///
-    /// # Return:
-    /// * - (number of bytes received, [received files]) on success
-    /// * - SocketRetry: temporary error caused by signals or short of resources.
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
-    ///
-    /// # Safety
-    ///
-    /// It is the callers responsibility to ensure it is safe for arbitrary data to be
-    /// written to the iovec pointers.
-    pub unsafe fn recv_into_iovec(
-        &mut self,
-        iovs: &mut [iovec],
-    ) -> Result<(usize, Option<Vec<File>>)> {
-        let mut fd_array = vec![0; MAX_ATTACHED_FD_ENTRIES];
-        let (bytes, fds) = self.sock.recv_with_fds(iovs, &mut fd_array)?;
-
-        let files = match fds {
-            0 => None,
-            n => {
-                let files = fd_array
-                    .iter()
-                    .take(n)
-                    .map(|fd| {
-                        // Safe because we have the ownership of `fd`.
-                        File::from_raw_fd(*fd)
-                    })
-                    .collect();
-                Some(files)
-            }
-        };
-
-        Ok((bytes, files))
-    }
-
-    /// Reads all bytes from the socket into the given scatter/gather vectors with optional
-    /// attached files. Will loop until all data has been transferred.
-    ///
-    /// The underlying communication channel is a Unix domain socket in STREAM mode. It's a little
-    /// tricky to pass file descriptors through such a communication channel. Let's assume that a
-    /// sender sending a message with some file descriptors attached. To successfully receive those
-    /// attached file descriptors, the receiver must obey following rules:
-    ///   1) file descriptors are attached to a message.
-    ///   2) message(packet) boundaries must be respected on the receive side.
-    ///
-    /// In other words, recvmsg() operations must not cross the packet boundary, otherwise the
-    /// attached file descriptors will get lost.
-    /// Note that this function wraps received file descriptors as `File`.
-    ///
-    /// # Return:
-    /// * - (number of bytes received, [received fds]) on success
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
-    ///
-    /// # Safety
-    ///
-    /// It is the callers responsibility to ensure it is safe for arbitrary data to be
-    /// written to the iovec pointers.
-    pub unsafe fn recv_into_iovec_all(
-        &mut self,
-        iovs: &mut [iovec],
-    ) -> Result<(usize, Option<Vec<File>>)> {
-        let mut data_read = 0;
-        let mut data_total = 0;
-        let mut rfds = None;
-        let iov_lens: Vec<usize> = iovs.iter().map(|iov| iov.iov_len).collect();
-        for len in &iov_lens {
-            data_total += len;
-        }
-
-        while (data_total - data_read) > 0 {
-            let (nr_skip, offset) = get_sub_iovs_offset(&iov_lens, data_read);
-            let iov = &mut iovs[nr_skip];
-
-            let mut data = [
-                &[iovec {
-                    iov_base: (iov.iov_base as usize + offset) as *mut c_void,
-                    iov_len: iov.iov_len - offset,
-                }],
-                &iovs[(nr_skip + 1)..],
-            ]
-            .concat();
-
-            let res = self.recv_into_iovec(&mut data);
-            match res {
-                Ok((0, _)) => return Ok((data_read, rfds)),
-                Ok((n, fds)) => {
-                    if data_read == 0 {
-                        rfds = fds;
-                    }
-                    data_read += n;
-                }
-                Err(e) => match e {
-                    Error::SocketRetry(_) => {}
-                    _ => return Err(e),
-                },
-            }
-        }
-        Ok((data_read, rfds))
-    }
-
-    /// Reads bytes from the socket into a new buffer with optional attached
-    /// files. Received file descriptors are set close-on-exec and converted to `File`.
-    ///
-    /// # Return:
-    /// * - (number of bytes received, buf, [received files]) on success.
-    /// * - SocketRetry: temporary error caused by signals or short of resources.
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
-    pub fn recv_into_buf(
-        &mut self,
-        buf_size: usize,
-    ) -> Result<(usize, Vec<u8>, Option<Vec<File>>)> {
-        let mut buf = vec![0u8; buf_size];
-        let (bytes, files) = {
-            let mut iovs = [iovec {
-                iov_base: buf.as_mut_ptr() as *mut c_void,
-                iov_len: buf_size,
-            }];
-            // SAFETY: Safe because we own buf and it's safe to fill a byte array with arbitrary data.
-            unsafe { self.recv_into_iovec(&mut iovs)? }
-        };
-        Ok((bytes, buf, files))
-    }
-
-    /// Receive a header-only message with optional attached files.
-    /// Note, only the first MAX_ATTACHED_FD_ENTRIES file descriptors will be
-    /// accepted and all other file descriptor will be discard silently.
-    ///
-    /// # Return:
-    /// * - (message header, [received files]) on success.
-    /// * - SocketRetry: temporary error caused by signals or short of resources.
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
-    /// * - PartialMessage: received a partial message.
-    /// * - InvalidMessage: received a invalid message.
-    pub fn recv_header(&mut self) -> Result<(H, Option<Vec<File>>)> {
-        let mut hdr = H::default();
-        let mut iovs = [iovec {
-            iov_base: (&mut hdr as *mut H) as *mut c_void,
-            iov_len: mem::size_of::<H>(),
-        }];
-        // SAFETY: Safe because we own hdr and it's ByteValued.
-        let (bytes, files) = unsafe { self.recv_into_iovec_all(&mut iovs[..])? };
-
-        if bytes == 0 {
-            return Err(Error::Disconnected);
-        } else if bytes != mem::size_of::<H>() {
-            return Err(Error::PartialMessage);
-        } else if !hdr.is_valid() {
-            return Err(Error::InvalidMessage);
-        }
-
-        Ok((hdr, files))
-    }
-
-    /// Receive a message with optional attached file descriptors.
-    /// Note, only the first MAX_ATTACHED_FD_ENTRIES file descriptors will be
-    /// accepted and all other file descriptor will be discard silently.
-    ///
-    /// # Return:
-    /// * - (message header, message body, [received files]) on success.
-    /// * - SocketRetry: temporary error caused by signals or short of resources.
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
-    /// * - PartialMessage: received a partial message.
-    /// * - InvalidMessage: received a invalid message.
-    pub fn recv_body<T: ByteValued + Sized + VhostUserMsgValidator + Default>(
-        &mut self,
-    ) -> Result<(H, T, Option<Vec<File>>)> {
-        let mut hdr = H::default();
-        let mut body: T = Default::default();
-        let mut iovs = [
-            iovec {
-                iov_base: (&mut hdr as *mut H) as *mut c_void,
-                iov_len: mem::size_of::<H>(),
-            },
-            iovec {
-                iov_base: (&mut body as *mut T) as *mut c_void,
-                iov_len: mem::size_of::<T>(),
-            },
-        ];
-        // SAFETY: Safe because we own hdr and body and they're ByteValued.
-        let (bytes, files) = unsafe { self.recv_into_iovec_all(&mut iovs[..])? };
-
-        let total = mem::size_of::<H>() + mem::size_of::<T>();
-        if bytes != total {
-            return Err(Error::PartialMessage);
-        } else if !hdr.is_valid() || !body.is_valid() {
-            return Err(Error::InvalidMessage);
-        }
-
-        Ok((hdr, body, files))
-    }
-
-    /// Receive a message with header and optional content. Callers need to
-    /// pre-allocate a big enough buffer to receive the message body and
-    /// optional payload. If there are attached file descriptor associated
-    /// with the message, the first MAX_ATTACHED_FD_ENTRIES file descriptors
-    /// will be accepted and all other file descriptor will be discard
-    /// silently.
-    ///
-    /// # Return:
-    /// * - (message header, message size, [received files]) on success.
-    /// * - SocketRetry: temporary error caused by signals or short of resources.
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
-    /// * - PartialMessage: received a partial message.
-    /// * - InvalidMessage: received a invalid message.
-    pub fn recv_body_into_buf(&mut self, buf: &mut [u8]) -> Result<(H, usize, Option<Vec<File>>)> {
-        let mut hdr = H::default();
-        let mut iovs = [
-            iovec {
-                iov_base: (&mut hdr as *mut H) as *mut c_void,
-                iov_len: mem::size_of::<H>(),
-            },
-            iovec {
-                iov_base: buf.as_mut_ptr() as *mut c_void,
-                iov_len: buf.len(),
-            },
-        ];
-        // SAFETY: Safe because we own hdr and have a mutable borrow of buf, and hdr is ByteValued
-        // and it's safe to fill a byte slice with arbitrary data.
-        let (bytes, files) = unsafe { self.recv_into_iovec_all(&mut iovs[..])? };
-
-        if bytes < mem::size_of::<H>() {
-            return Err(Error::PartialMessage);
-        } else if !hdr.is_valid() {
-            return Err(Error::InvalidMessage);
-        }
-
-        Ok((hdr, bytes - mem::size_of::<H>(), files))
-    }
-
-    /// Receive a message with optional payload and attached file descriptors.
-    /// Note, only the first MAX_ATTACHED_FD_ENTRIES file descriptors will be
-    /// accepted and all other file descriptor will be discard silently.
-    ///
-    /// # Return:
-    /// * - (message header, message body, size of payload, [received files]) on success.
-    /// * - SocketRetry: temporary error caused by signals or short of resources.
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
-    /// * - PartialMessage: received a partial message.
-    /// * - InvalidMessage: received a invalid message.
-    #[allow(clippy::type_complexity)]
-    pub fn recv_payload_into_buf<T: ByteValued + Sized + VhostUserMsgValidator + Default>(
-        &mut self,
-        buf: &mut [u8],
-    ) -> Result<(H, T, usize, Option<Vec<File>>)> {
-        let mut hdr = H::default();
-        let mut body: T = Default::default();
-        let mut iovs = [
-            iovec {
-                iov_base: (&mut hdr as *mut H) as *mut c_void,
-                iov_len: mem::size_of::<H>(),
-            },
-            iovec {
-                iov_base: (&mut body as *mut T) as *mut c_void,
-                iov_len: mem::size_of::<T>(),
-            },
-            iovec {
-                iov_base: buf.as_mut_ptr() as *mut c_void,
-                iov_len: buf.len(),
-            },
-        ];
-        // SAFETY: Safe because we own hdr and body and have a mutable borrow of buf, and
-        // hdr and body are ByteValued, and it's safe to fill a byte slice with
-        // arbitrary data.
-        let (bytes, files) = unsafe { self.recv_into_iovec_all(&mut iovs[..])? };
-
-        let total = mem::size_of::<H>() + mem::size_of::<T>();
-        if bytes < total {
-            return Err(Error::PartialMessage);
-        } else if !hdr.is_valid() || !body.is_valid() {
-            return Err(Error::InvalidMessage);
-        }
-
-        Ok((hdr, body, bytes - total, files))
-    }
-}
-
-impl<H: MsgHeader> AsRawFd for Endpoint<H> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.sock.as_raw_fd()
     }
 }
 
@@ -619,11 +309,13 @@ fn get_sub_iovs_offset(iov_lens: &[usize], skip_size: usize) -> (usize, usize) {
     (nr_skip, size)
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::fd::IntoRawFd;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
     use vmm_sys_util::rand::rand_alphanumerics;
     use vmm_sys_util::tempfile::TempFile;
 

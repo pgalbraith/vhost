@@ -45,7 +45,7 @@ impl<'a, S: VhostUserBackendReqHandler> BackendListener<'a, S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 mod tests {
     use std::sync::Mutex;
 

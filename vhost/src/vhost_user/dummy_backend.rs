@@ -273,6 +273,7 @@ impl VhostUserBackendReqHandlerMut for DummyBackendReqHandler {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn set_gpu_socket(&mut self, _gpu_backend: GpuBackend) -> Result<()> {
         Ok(())
     }

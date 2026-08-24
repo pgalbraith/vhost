@@ -3,16 +3,28 @@
 
 use std::fs::File;
 use std::mem;
-use std::os::fd::{AsFd, BorrowedFd};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::slice;
 use std::sync::{Arc, Mutex};
 
+// The requests handled below that hand over a descriptor, and the channels set up out of one, all
+// belong to protocol features that are not negotiated on Windows, where the protocol names Win32
+// objects in the message payload instead of attaching descriptors to it. See the
+// [`win32`](super::win32) module.
+#[cfg(unix)]
+use std::os::fd::{AsFd, BorrowedFd};
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use uds_windows::UnixStream;
+
 use vm_memory::ByteValued;
 
+#[cfg(unix)]
 use super::backend_req::Backend;
 use super::connection::Endpoint;
+#[cfg(unix)]
 use super::gpu_backend_req::GpuBackend;
 use super::message::*;
 use super::{take_single_file, Error, Result};
@@ -67,7 +79,9 @@ pub trait VhostUserBackendReqHandler {
     fn set_vring_enable(&self, index: u32, enable: bool) -> Result<()>;
     fn get_config(&self, offset: u32, size: u32, flags: VhostUserConfigFlags) -> Result<Vec<u8>>;
     fn set_config(&self, offset: u32, buf: &[u8], flags: VhostUserConfigFlags) -> Result<()>;
+    #[cfg(unix)]
     fn set_backend_req_fd(&self, _backend: Backend) {}
+    #[cfg(unix)]
     fn set_gpu_socket(&self, _gpu_backend: GpuBackend) -> Result<()>;
     fn get_shared_object(&self, uuid: VhostUserSharedMsg) -> Result<File>;
     fn get_inflight_fd(&self, inflight: &VhostUserInflight) -> Result<(VhostUserInflight, File)>;
@@ -130,7 +144,9 @@ pub trait VhostUserBackendReqHandlerMut {
         flags: VhostUserConfigFlags,
     ) -> Result<Vec<u8>>;
     fn set_config(&mut self, offset: u32, buf: &[u8], flags: VhostUserConfigFlags) -> Result<()>;
+    #[cfg(unix)]
     fn set_backend_req_fd(&mut self, _backend: Backend) {}
+    #[cfg(unix)]
     fn set_gpu_socket(&mut self, _gpu_backend: GpuBackend) -> Result<()>;
     fn get_shared_object(&mut self, uuid: VhostUserSharedMsg) -> Result<File>;
     fn get_inflight_fd(
@@ -245,10 +261,12 @@ impl<T: VhostUserBackendReqHandlerMut> VhostUserBackendReqHandler for Mutex<T> {
         self.lock().unwrap().set_config(offset, buf, flags)
     }
 
+    #[cfg(unix)]
     fn set_backend_req_fd(&self, backend: Backend) {
         self.lock().unwrap().set_backend_req_fd(backend)
     }
 
+    #[cfg(unix)]
     fn set_gpu_socket(&self, gpu_backend: GpuBackend) -> Result<()> {
         self.lock().unwrap().set_gpu_socket(gpu_backend)
     }
@@ -575,12 +593,14 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
                 let res = self.set_config(size, &buf);
                 self.send_ack_message(&hdr, res)?;
             }
+            #[cfg(unix)]
             Ok(FrontendReq::SET_BACKEND_REQ_FD) => {
                 self.check_proto_feature(VhostUserProtocolFeatures::BACKEND_REQ)?;
                 self.check_request_size(&hdr, size, hdr.get_size() as usize)?;
                 let res = self.set_backend_req_fd(files);
                 self.send_ack_message(&hdr, res)?;
             }
+            #[cfg(unix)]
             Ok(FrontendReq::GET_SHARED_OBJECT) => {
                 self.check_proto_feature(VhostUserProtocolFeatures::SHARED_OBJECT)?;
                 self.check_request_size(&hdr, size, hdr.get_size() as usize)?;
@@ -601,6 +621,7 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
                     }
                 }
             }
+            #[cfg(unix)]
             Ok(FrontendReq::GET_INFLIGHT_FD) => {
                 self.check_proto_feature(VhostUserProtocolFeatures::INFLIGHT_SHMFD)?;
 
@@ -617,6 +638,7 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
                 let res = self.backend.set_inflight_fd(&msg, file);
                 self.send_ack_message(&hdr, res)?;
             }
+            #[cfg(unix)]
             Ok(FrontendReq::GPU_SET_SOCKET) => {
                 let res = self.set_gpu_socket(files);
                 self.send_ack_message(&hdr, res)?;
@@ -647,6 +669,7 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
                 let res = self.backend.remove_mem_region(&msg);
                 self.send_ack_message(&hdr, res)?;
             }
+            #[cfg(unix)]
             Ok(FrontendReq::SET_DEVICE_STATE_FD) => {
                 let file = take_single_file(files).ok_or(Error::IncorrectFds)?;
                 let msg =
@@ -851,6 +874,7 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
             .set_config(msg.offset, &buf[mem::size_of::<VhostUserConfig>()..], flags)
     }
 
+    #[cfg(unix)]
     fn set_backend_req_fd(&mut self, files: Option<Vec<File>>) -> Result<()> {
         let file = take_single_file(files).ok_or(Error::InvalidMessage)?;
         // Validate that the received file descriptor is an AF_UNIX SOCK_STREAM
@@ -867,6 +891,7 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn set_gpu_socket(&mut self, files: Option<Vec<File>>) -> Result<()> {
         let file = take_single_file(files).ok_or(Error::InvalidMessage)?;
         // Validate that the received file descriptor is an AF_UNIX SOCK_STREAM
@@ -1041,13 +1066,22 @@ impl<S: VhostUserBackendReqHandler> BackendReqHandler<S> {
     }
 }
 
+#[cfg(unix)]
 impl<S: VhostUserBackendReqHandler> AsRawFd for BackendReqHandler<S> {
     fn as_raw_fd(&self) -> RawFd {
         self.main_sock.as_raw_fd()
     }
 }
 
+#[cfg(windows)]
+impl<S: VhostUserBackendReqHandler> std::os::windows::io::AsRawSocket for BackendReqHandler<S> {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        self.main_sock.as_raw_socket()
+    }
+}
+
 // Retrieve a SOL_SOCKET socket option value using `getsockopt`.
+#[cfg(unix)]
 fn get_socket_opt(fd: BorrowedFd<'_>, opt: libc::c_int) -> std::io::Result<libc::c_int> {
     let mut value: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -1076,6 +1110,7 @@ fn get_socket_opt(fd: BorrowedFd<'_>, opt: libc::c_int) -> std::io::Result<libc:
 }
 
 // Validate that the given file descriptor is an AF_UNIX SOCK_STREAM socket.
+#[cfg(unix)]
 fn validate_unix_stream_socket_fd(fd: BorrowedFd<'_>) -> Result<()> {
     let domain = get_socket_opt(fd, libc::SO_DOMAIN).map_err(Error::InvalidSocketFd)?;
     if domain != libc::AF_UNIX {
@@ -1090,7 +1125,7 @@ fn validate_unix_stream_socket_fd(fd: BorrowedFd<'_>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 mod tests {
     use std::net::TcpListener;
     use std::os::unix::io::AsRawFd;

@@ -26,13 +26,16 @@ pub use self::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 mod connection;
 pub use self::connection::Listener;
 
-#[cfg(feature = "vhost-user-frontend")]
+// The frontend side of the protocol is the side that passes out the objects backing guest memory
+// and the vring notifications. On Windows those are named kernel objects created by the frontend,
+// which is QEMU, so there is no Rust frontend to support there and these modules stay POSIX only.
+#[cfg(all(unix, feature = "vhost-user-frontend"))]
 mod frontend;
-#[cfg(feature = "vhost-user-frontend")]
+#[cfg(all(unix, feature = "vhost-user-frontend"))]
 pub use self::frontend::{Frontend, VhostUserFrontend};
-#[cfg(feature = "vhost-user")]
+#[cfg(all(unix, feature = "vhost-user"))]
 mod frontend_req_handler;
-#[cfg(feature = "vhost-user")]
+#[cfg(all(unix, feature = "vhost-user"))]
 pub use self::frontend_req_handler::{
     FrontendReqHandler, VhostUserFrontendReqHandler, VhostUserFrontendReqHandlerMut,
 };
@@ -47,12 +50,18 @@ mod backend_req_handler;
 pub use self::backend_req_handler::{
     BackendReqHandler, VhostUserBackendReqHandler, VhostUserBackendReqHandlerMut,
 };
-#[cfg(feature = "vhost-user-backend")]
+// The backend request channel and the GPU socket are both established by handing a socket over the
+// connection, which Windows cannot do. Both belong to protocol features that are not negotiated
+// there, so the backend never sees the requests that would set them up.
+#[cfg(all(unix, feature = "vhost-user-backend"))]
 mod backend_req;
-#[cfg(feature = "vhost-user-backend")]
+#[cfg(all(unix, feature = "vhost-user-backend"))]
 pub use self::backend_req::Backend;
+#[cfg(unix)]
 mod gpu_backend_req;
+#[cfg(unix)]
 pub mod gpu_message;
+#[cfg(unix)]
 pub use self::gpu_backend_req::GpuBackend;
 
 /// Errors for vhost-user operations
@@ -272,10 +281,16 @@ macro_rules! enum_value {
 
 use enum_value;
 
-#[cfg(all(test, feature = "vhost-user-backend"))]
+// Only used by the tests below and in `backend_req_handler`, both of which are POSIX only.
+#[cfg(all(unix, test, feature = "vhost-user-backend"))]
 mod dummy_backend;
 
-#[cfg(all(test, feature = "vhost-user-frontend", feature = "vhost-user-backend"))]
+#[cfg(all(
+    unix,
+    test,
+    feature = "vhost-user-frontend",
+    feature = "vhost-user-backend"
+))]
 mod tests {
     use message::VhostUserSharedMsg;
     use std::fs::File;

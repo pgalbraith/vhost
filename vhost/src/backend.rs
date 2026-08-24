@@ -9,17 +9,30 @@
 
 //! Common traits and structs for vhost-kern and vhost-user backend drivers.
 
+// The traits and structs below that carry raw file descriptors are only meaningful on
+// platforms with a POSIX descriptor model: they belong to the vhost-kern drivers and to the
+// vhost-user *frontend*, neither of which is supported on Windows. The descriptor-free items
+// (vring configuration, IOTLB messages) stay portable. See the module docs in `vhost_user` for
+// how the Windows vhost-user backend replaces descriptor passing.
+#[cfg(unix)]
 use std::cell::RefCell;
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
+#[cfg(unix)]
 use std::sync::RwLock;
 
+#[cfg(unix)]
 use vm_memory::{bitmap::Bitmap, Address, GuestMemoryRegion, GuestRegionMmap};
+#[cfg(unix)]
 use vmm_sys_util::eventfd::EventFd;
 
-#[cfg(feature = "vhost-user")]
+#[cfg(all(unix, feature = "vhost-user"))]
 use super::vhost_user::message::{VhostUserMemoryRegion, VhostUserSingleMemoryRegion};
-use super::{Error, Result};
+#[cfg(unix)]
+use super::Error;
+use super::Result;
 
 /// Maximum number of memory regions supported.
 pub const VHOST_MAX_MEMORY_REGIONS: usize = 255;
@@ -64,6 +77,7 @@ impl VringConfigData {
 }
 
 /// Memory region configuration data.
+#[cfg(unix)]
 #[derive(Default, Clone, Copy)]
 pub struct VhostUserMemoryRegionInfo {
     /// Guest physical address of the memory region.
@@ -86,6 +100,7 @@ pub struct VhostUserMemoryRegionInfo {
     pub xen_mmap_data: u32,
 }
 
+#[cfg(unix)]
 impl VhostUserMemoryRegionInfo {
     /// Creates Self from GuestRegionMmap.
     pub fn from_guest_region<B: Bitmap>(region: &GuestRegionMmap<B>) -> Result<Self> {
@@ -107,7 +122,7 @@ impl VhostUserMemoryRegionInfo {
     }
 
     /// Creates VhostUserMemoryRegion from Self.
-    #[cfg(feature = "vhost-user")]
+    #[cfg(all(unix, feature = "vhost-user"))]
     pub fn to_region(&self) -> VhostUserMemoryRegion {
         #[cfg(not(feature = "xen"))]
         return VhostUserMemoryRegion::new(
@@ -129,7 +144,7 @@ impl VhostUserMemoryRegionInfo {
     }
 
     /// Creates VhostUserSingleMemoryRegion from Self.
-    #[cfg(feature = "vhost-user")]
+    #[cfg(all(unix, feature = "vhost-user"))]
     pub fn to_single_region(&self) -> VhostUserSingleMemoryRegion {
         VhostUserSingleMemoryRegion::new(
             self.guest_phys_addr,
@@ -145,6 +160,7 @@ impl VhostUserMemoryRegionInfo {
 }
 
 /// Shared memory region data for logging dirty pages
+#[cfg(unix)]
 #[derive(Default, Clone, Copy)]
 pub struct VhostUserDirtyLogRegion {
     /// Size of the shared memory region for logging dirty pages
@@ -235,6 +251,7 @@ pub trait VhostIotlbBackend: std::marker::Sized {
 /// VMM process. Typically fast paths for IO operations are delegated to the dedicated IO service
 /// processes, and slow path for device configuration are still handled by the VMM process. It may
 /// also be used to control access permissions of virtio backend devices.
+#[cfg(unix)]
 pub trait VhostBackend: std::marker::Sized {
     /// Get a bitmask of supported virtio/vhost features.
     fn get_features(&self) -> Result<u64>;
@@ -321,6 +338,7 @@ pub trait VhostBackend: std::marker::Sized {
 /// VMM process. Typically fast paths for IO operations are delegated to the dedicated IO service
 /// processes, and slow path for device configuration are still handled by the VMM process. It may
 /// also be used to control access permissions of virtio backend devices.
+#[cfg(unix)]
 pub trait VhostBackendMut: std::marker::Sized {
     /// Get a bitmask of supported virtio/vhost features.
     fn get_features(&mut self) -> Result<u64>;
@@ -396,6 +414,7 @@ pub trait VhostBackendMut: std::marker::Sized {
     fn set_vring_err(&mut self, queue_index: usize, fd: &EventFd) -> Result<()>;
 }
 
+#[cfg(unix)]
 impl<T: VhostBackendMut> VhostBackend for RwLock<T> {
     fn get_features(&self) -> Result<u64> {
         self.write().unwrap().get_features()
@@ -456,6 +475,7 @@ impl<T: VhostBackendMut> VhostBackend for RwLock<T> {
     }
 }
 
+#[cfg(unix)]
 impl<T: VhostBackendMut> VhostBackend for RefCell<T> {
     fn get_features(&self) -> Result<u64> {
         self.borrow_mut().get_features()
@@ -514,7 +534,7 @@ impl<T: VhostBackendMut> VhostBackend for RefCell<T> {
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(all(unix, any(test, feature = "test-utils")))]
 impl VhostUserMemoryRegionInfo {
     /// creates instance of `VhostUserMemoryRegionInfo`.
     pub fn new(
@@ -539,7 +559,7 @@ impl VhostUserMemoryRegionInfo {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 mod tests {
     use super::*;
 
