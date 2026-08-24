@@ -17,7 +17,10 @@ use std::ops::Deref;
 
 use uuid::Uuid;
 
-use vm_memory::{mmap::NewBitmap, ByteValued, FileOffset, MmapRegion};
+use vm_memory::{mmap::NewBitmap, ByteValued, MmapRegion};
+// Only the file-backed mapping paths need this; the Windows one maps a section directly.
+#[cfg(any(unix, feature = "xen"))]
+use vm_memory::FileOffset;
 
 #[cfg(feature = "xen")]
 use vm_memory::{GuestAddress, MmapRange, MmapXenFlags};
@@ -642,12 +645,30 @@ impl VhostUserMemoryRegion {
     }
 
     /// Creates mmap region from Self.
+    #[cfg(unix)]
     pub fn mmap_region<B: NewBitmap>(&self, file: File) -> Result<MmapRegion<B>> {
         MmapRegion::<B>::from_file(
             FileOffset::new(file, self.mmap_offset),
             self.memory_size as usize,
         )
         .map_err(|e| Error::ReqHandlerError(io::Error::other(e)))
+    }
+
+    /// Creates mmap region from Self.
+    ///
+    /// The Windows transport delivers guest memory as the *name* of a section, which
+    /// [`win32::take_named_objects`](super::win32::take_named_objects) opens with
+    /// `OpenFileMappingA`. What arrives here is therefore already a section object, and must be
+    /// mapped rather than used to create one: `MmapRegion::from_file` calls `CreateFileMappingA`,
+    /// which requires a *file* handle and rejects a section with `ERROR_INVALID_HANDLE`.
+    ///
+    /// The `File` wrapper is only an owning handle wrapper — see `open_named_object` — so it is
+    /// borrowed for the mapping and then dropped. That is safe: Windows keeps a section alive for
+    /// as long as any view of it exists, so closing the handle does not invalidate the mapping.
+    #[cfg(windows)]
+    pub fn mmap_region<B: NewBitmap>(&self, section: File) -> Result<MmapRegion<B>> {
+        MmapRegion::<B>::from_section(&section, self.mmap_offset, self.memory_size as usize)
+            .map_err(|e| Error::ReqHandlerError(io::Error::other(e)))
     }
 
     fn is_valid(&self) -> bool {
