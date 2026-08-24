@@ -9,5 +9,7 @@ members = [
 [workspace.dependencies]
 virtio-bindings = "0.2.7"
 virtio-queue = "0.18.0"
-vm-memory = "0.18.0"
+# `default-features = false` here so member crates can opt out of vm-memory's default
+# `rawfd` feature, which is a hard `compile_error!()` on Windows targets.
+vm-memory = { version = "0.18.0", default-features = false }
 vmm-sys-util = "0.15.0"
