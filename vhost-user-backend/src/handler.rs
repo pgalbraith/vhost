@@ -477,14 +477,45 @@ where
             .get(index as usize)
             .ok_or(VhostUserError::InvalidParam)?;
 
+        // If the vring already has a kick descriptor registered with the epoll, unregister it
+        // before replacing it. `SET_VRING_KICK` is not guaranteed to arrive only once per vring
+        // lifetime, so without this a live, registered descriptor can be dropped here. Closing a
+        // registered descriptor without unregistering it first is silently safe on Linux — epoll
+        // implicitly drops a closed fd from every interest list — but is undefined behavior on
+        // Windows, where a registered handle must be explicitly unregistered before it is closed
+        // (see `vmm_sys_util::epoll::Epoll::ctl`'s docs; its wait callback can still reference the
+        // handle).
+        if let Some(old_kick) = vring.get_ref().get_kick() {
+            let old_raw = raw_descriptor(old_kick);
+            for (thread_index, queues_mask) in self.queues_per_thread.iter().enumerate() {
+                let shifted_queues_mask = queues_mask >> index;
+                if shifted_queues_mask & 1u64 == 1u64 {
+                    let evt_idx = queues_mask.count_ones() - shifted_queues_mask.count_ones();
+                    let _ = self.handlers[thread_index].unregister_event(
+                        old_raw,
+                        EventSet::IN,
+                        u64::from(evt_idx),
+                    );
+                    break;
+                }
+            }
+        }
+
         // SAFETY: EventFd requires that it has sole ownership of its fd. So
         // does File, so this is safe.
         // Ideally, we'd have a generic way to refer to a uniquely-owned fd,
         // such as that proposed by Rust RFC #3128.
         vring.set_kick(file);
 
+        // The first kick descriptor to arrive marks the vring ready. Every kick change beyond
+        // that — a later replacement on an already-ready vring — still needs
+        // `update_vring_registration` to register the *new* descriptor if the vring is enabled;
+        // without this `else`, replacing a live kick would leave the new one unregistered and
+        // silently stop kick delivery on that vring, on any platform.
         if self.vring_needs_init(vring) {
             self.initialize_vring(vring, index)?;
+        } else {
+            self.update_vring_registration(vring, index)?;
         }
 
         Ok(())
@@ -889,5 +920,62 @@ mod tests {
 
         let events = backend.lock().unwrap().events();
         assert_eq!(events, 1, "Backend SHOULD have been kicked after enabling");
+    }
+
+    // Regression test for a `set_vring_kick` bug found while porting this crate to Windows:
+    // replacing a vring's kick descriptor while the vring was already ready and enabled dropped
+    // the old, still-registered descriptor without unregistering it first (undefined behavior on
+    // Windows, where a registered handle must be explicitly unregistered before it is closed —
+    // harmless on Linux), and never registered the *new* descriptor at all, since
+    // `vring_needs_init()` only re-registers on the vring's first-ever kick. The second half was
+    // a real, platform-independent bug: kicking the new descriptor was silently ignored.
+    #[test]
+    fn test_replace_live_kick() {
+        let mem = GuestMemoryAtomic::new(
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
+        );
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let mut handler = VhostUserHandler::new(backend.clone(), mem.clone()).unwrap();
+        handler
+            .set_features(VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits())
+            .unwrap();
+
+        let vring_index = 0;
+
+        let (first_consumer, first_notifier) =
+            new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
+        #[cfg(unix)]
+        let first_file = unsafe { File::from_raw_fd(first_consumer.into_raw_fd()) };
+        #[cfg(windows)]
+        let first_file = unsafe { File::from_raw_handle(first_consumer.into_raw_handle()) };
+        handler
+            .set_vring_kick(vring_index as u8, Some(first_file))
+            .unwrap();
+        handler.set_vring_enable(vring_index as u32, true).unwrap();
+
+        // The vring is now ready and enabled, so its kick descriptor is live in the epoll.
+        // Replace it with a second one — the scenario `set_vring_kick`'s fix above exists for.
+        let (second_consumer, second_notifier) =
+            new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
+        #[cfg(unix)]
+        let second_file = unsafe { File::from_raw_fd(second_consumer.into_raw_fd()) };
+        #[cfg(windows)]
+        let second_file = unsafe { File::from_raw_handle(second_consumer.into_raw_handle()) };
+        handler
+            .set_vring_kick(vring_index as u8, Some(second_file))
+            .unwrap();
+
+        // The old notifier no longer reaches anything registered — nothing to assert on that
+        // beyond "this doesn't hang or crash", which running the test at all already proves.
+        let _ = first_notifier.notify();
+
+        second_notifier.notify().unwrap();
+        thread::sleep(Duration::from_millis(200));
+
+        let events = backend.lock().unwrap().events();
+        assert_eq!(
+            events, 1,
+            "Backend SHOULD have been kicked via the replacement descriptor"
+        );
     }
 }
