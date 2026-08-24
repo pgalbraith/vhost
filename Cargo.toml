@@ -13,3 +13,14 @@ virtio-queue = "0.18.0"
 # `rawfd` feature, which is a hard `compile_error!()` on Windows targets.
 vm-memory = { version = "0.18.0", default-features = false }
 vmm-sys-util = "0.15.0"
+
+# Pre-PR scaffolding: neither fix below is published yet. Pinned by git rev so a standalone
+# clone of this repo builds on Windows without extra local setup, matching how the sibling
+# virtiofsd workspace pins the same commit in its own manifest. Cargo only honors a `[patch]`
+# section from the top-level manifest of whatever's being built, so this has no effect on
+# anyone consuming `vhost`/`vhost-user-backend` as a dependency — only on building this repo
+# directly. Remove before submitting upstream; the two fixes are on
+# https://github.com/pgalbraith/rust-vmm's `windows-support` branch, not yet in a PR either.
+[patch.crates-io]
+vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "f1835ab356be3b39a4cb1b0d05cc682271b34a56" }
+vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "f1835ab356be3b39a4cb1b0d05cc682271b34a56" }
