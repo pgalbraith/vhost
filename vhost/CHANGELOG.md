@@ -3,9 +3,19 @@
 ## [Unreleased]
 
 ### Added
+- [[#PR]] Add a Windows vhost-user backend transport. Wherever the protocol attaches file
+  descriptors via `SCM_RIGHTS`, the Windows transport names Win32 kernel objects in the message
+  payload instead; see the `win32` module and `connection/windows.rs`.
+
 ### Changed
+- [[#PR]] Split `connection.rs`'s POSIX-specific code into `connection/unix.rs`, and gate the
+  vhost-user frontend, GPU channel, and backend request channel to unix — none has a Windows
+  counterpart.
+
 ### Deprecated
 ### Fixed
+- [[#PR]] Don't enable `vm-memory`'s `rawfd` feature on Windows targets, where it is a hard
+  `compile_error!()`.
 
 ## v0.17.0
 

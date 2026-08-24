@@ -3,9 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- [[#PR]] Port to Windows: `RawDescriptor` (an `AsRawHandle`-based alias for `RawFd`) replaces
+  `RawFd` in `register_listener`/`unregister_listener`; `Backend`/`GpuBackend`-dependent methods
+  are gated to unix, matching the vhost crate; `MmapLogReg`'s Windows constructor returns
+  `Unsupported`, since `VHOST_USER_PROTOCOL_F_LOG_SHMFD` is masked by the front-end there.
+
 ### Changed
 ### Deprecated
 ### Fixed
+- [[#PR]] Fix `set_vring_kick` dropping a live, registered kick descriptor when replaced rather
+  than unregistering it first, and never registering its replacement — the replacement was
+  silently never kicked. Not Windows-specific: the missing re-registration affected Linux too.
 
 ## v0.23.0
 
