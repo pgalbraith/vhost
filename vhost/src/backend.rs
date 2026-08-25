@@ -9,11 +9,9 @@
 
 //! Common traits and structs for vhost-kern and vhost-user backend drivers.
 
-// The traits and structs below that carry raw file descriptors are only meaningful on
-// platforms with a POSIX descriptor model: they belong to the vhost-kern drivers and to the
-// vhost-user *frontend*, neither of which is supported on Windows. The descriptor-free items
-// (vring configuration, IOTLB messages) stay portable. See the module docs in `vhost_user` for
-// how the Windows vhost-user backend replaces descriptor passing.
+// Below: APIs that carry raw fds — vhost-kern drivers and the vhost-user frontend, neither
+// supported on Windows. Descriptor-free items (vring config, IOTLB) stay portable. See the
+// `vhost_user` module docs for how the Windows backend replaces descriptor passing.
 #[cfg(unix)]
 use std::cell::RefCell;
 #[cfg(unix)]

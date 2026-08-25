@@ -6,10 +6,8 @@ use std::mem;
 use std::slice;
 use std::sync::{Arc, Mutex};
 
-// The requests handled below that hand over a descriptor, and the channels set up out of one, all
-// belong to protocol features that are not negotiated on Windows, where the protocol names Win32
-// objects in the message payload instead of attaching descriptors to it. See the
-// [`win32`](super::win32) module.
+// Requests that hand over a descriptor aren't negotiated on Windows: the protocol names Win32
+// objects in the payload instead of attaching descriptors. See [`win32`](super::win32).
 #[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(unix)]

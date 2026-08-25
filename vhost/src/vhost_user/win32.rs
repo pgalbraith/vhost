@@ -1,28 +1,25 @@
 // Copyright (C) 2026 Paul Galbraith. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Windows replacement for the descriptor passing the vhost-user protocol relies on.
+//! Windows replacement for `SCM_RIGHTS` descriptor passing.
 //!
-//! On POSIX the protocol hands over the descriptors backing guest memory and the vring
-//! kick/call/err notifications as `SCM_RIGHTS` ancillary data. Windows has no equivalent: the only
-//! way to move a `HANDLE` between processes is `DuplicateHandle`, which requires knowing the peer's
-//! process id up front, and vhost-user's backend is by design "whatever process connects to this
-//! socket".
+//! POSIX hands over guest-memory descriptors and vring kick/call/err notifications as `SCM_RIGHTS`
+//! ancillary data. Windows has no equivalent: moving a `HANDLE` between processes needs
+//! `DuplicateHandle`, which requires the peer's process id up front, but vhost-user's backend
+//! accepts any process that connects to the socket.
 //!
-//! The Windows transport therefore passes *names* of Win32 kernel objects instead of handles. The
-//! object is created named in the `Local\` namespace by whichever side owns it, and wherever POSIX
-//! attaches K descriptors to a message, Windows appends K fixed-size name records to that message's
-//! payload:
+//! So the Windows transport passes *names* of Win32 kernel objects instead of handles. The owning
+//! side creates the object named in the `Local\` namespace; wherever POSIX attaches K descriptors
+//! to a message, Windows appends K fixed-size name records to the payload:
 //!
 //! * each record is [`VHOST_USER_WIN32_NAME_SIZE`] bytes, NUL-terminated and NUL-padded;
-//! * the message header's `size` field *includes* the trailer, so the records travel inside the
-//!   normal payload of a plain byte-stream `AF_UNIX` socket and stay associated with their message
-//!   without any extra framing;
-//! * there is no count field on the wire — K is implied by the request, exactly as the
-//!   `SCM_RIGHTS` descriptor count is on POSIX (see [`super::message::Req::win32_name_trailer`]).
+//! * the header's `size` field includes the trailer, so records travel inside the normal payload
+//!   with no extra framing;
+//! * there's no count field on the wire — K is implied by the request, same as the `SCM_RIGHTS`
+//!   descriptor count on POSIX (see [`super::message::Req::win32_name_trailer`]).
 //!
-//! Names are opaque. The peer mints them and may change how it does so, so they are passed to
-//! Win32 exactly as received and never parsed, validated, or re-encoded here.
+//! Names are opaque: the peer mints them and may change how, so they're passed to Win32 exactly as
+//! received, never parsed, validated, or re-encoded here.
 
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
@@ -77,8 +74,8 @@ pub fn take_named_objects(
 
 /// Open the named object described by a single name record.
 fn open_named_object(kind: Win32ObjectKind, record: &[u8]) -> Result<File> {
-    // The record is NUL-terminated within its fixed size, so it is already a valid C string and can
-    // be handed to Win32 as-is. A record with no NUL at all would run off the end of the buffer.
+    // Already NUL-terminated within its bounds, so it's a valid C string as-is; without a NUL
+    // it'd run off the end of the buffer.
     if !record.contains(&0) {
         return Err(Error::InvalidMessage);
     }
@@ -97,12 +94,11 @@ fn open_named_object(kind: Win32ObjectKind, record: &[u8]) -> Result<File> {
         return Err(Error::Win32ObjectOpen(std::io::Error::last_os_error()));
     }
 
-    // SAFETY: `handle` is a valid kernel object handle that we exclusively own.
+    // SAFETY: `handle` is a valid kernel object handle we exclusively own.
     //
-    // `File` is used purely as an owning handle wrapper: its `Drop` calls `CloseHandle`, which is
-    // the correct disposal for section and event objects alike. Wrapping them keeps the request
-    // handler API identical on both platforms — on POSIX an eventfd likewise reaches the handler as
-    // a `File` — and callers immediately convert the handle into whatever they actually need.
+    // `File` is just an owning wrapper here — `Drop` calls `CloseHandle`, correct for both section
+    // and event objects — kept so the handler API matches POSIX, where an eventfd also arrives as
+    // a `File`. Callers convert to whatever they actually need.
     Ok(unsafe { File::from_raw_handle(handle as _) })
 }
 

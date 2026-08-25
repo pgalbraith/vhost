@@ -29,9 +29,8 @@ pub use self::connection::Listener;
 #[cfg(windows)]
 mod win32;
 
-// The frontend side of the protocol is the side that passes out the objects backing guest memory
-// and the vring notifications. On Windows those are named kernel objects created by the frontend,
-// which is QEMU, so there is no Rust frontend to support there and these modules stay POSIX only.
+// The frontend hands out the objects backing guest memory and vring notifications. On Windows
+// that's QEMU handing out named kernel objects, not this crate, so there's no frontend here.
 #[cfg(all(unix, feature = "vhost-user-frontend"))]
 mod frontend;
 #[cfg(all(unix, feature = "vhost-user-frontend"))]
@@ -53,9 +52,8 @@ mod backend_req_handler;
 pub use self::backend_req_handler::{
     BackendReqHandler, VhostUserBackendReqHandler, VhostUserBackendReqHandlerMut,
 };
-// The backend request channel and the GPU socket are both established by handing a socket over the
-// connection, which Windows cannot do. Both belong to protocol features that are not negotiated
-// there, so the backend never sees the requests that would set them up.
+// Backend-req channel and GPU socket are both set up by handing a socket over the connection,
+// which Windows can't do — those protocol features are never negotiated there.
 #[cfg(all(unix, feature = "vhost-user-backend"))]
 mod backend_req;
 #[cfg(all(unix, feature = "vhost-user-backend"))]

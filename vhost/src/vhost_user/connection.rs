@@ -3,15 +3,14 @@
 
 //! Structs for `AF_UNIX` listener and endpoint.
 //!
-//! The control channel of a vhost-user connection is an `AF_UNIX` byte stream on every supported
-//! platform. What differs is how the objects the protocol needs to hand over — the memory backing
-//! guest RAM and the vring kick/call/err notifications — travel across it. On POSIX they are
-//! descriptors attached to a message as `SCM_RIGHTS` ancillary data; Windows has no equivalent, so
-//! there they are named kernel objects whose names ride along in the message payload. See the
-//! [`win32`](super::win32) module for that scheme.
+//! The vhost-user control channel is an `AF_UNIX` byte stream on every platform. What differs is
+//! how the objects the protocol hands over — guest memory, vring kick/call/err — travel across it:
+//! on POSIX they're descriptors attached via `SCM_RIGHTS`; Windows has no descriptor passing, so
+//! there they're named kernel objects whose names ride in the message payload. See
+//! [`win32`](super::win32) for that scheme.
 //!
-//! The platform-specific halves of [`Endpoint`] live in [`unix`] and [`windows`]; everything that
-//! does not depend on how objects are passed is shared.
+//! The platform-specific halves of [`Endpoint`] live in [`unix`] and [`windows`]; the rest is
+//! shared.
 
 #![allow(dead_code)]
 
@@ -34,11 +33,9 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-/// A raw handle on an object the protocol passes between peers.
-///
-/// This is what the send side takes for the objects it attaches to a message. There is no Windows
-/// counterpart to descriptor passing, so on Windows nothing may be attached and the Windows
-/// [`Endpoint::send_iovec`] rejects a non-empty slice; objects are named in the payload instead.
+/// A raw handle the send side attaches to a message for an object the protocol passes between
+/// peers. Windows has no descriptor-passing counterpart, so [`Endpoint::send_iovec`] rejects a
+/// non-empty slice there; objects are named in the payload instead.
 #[cfg(unix)]
 pub(super) type RawDescriptor = std::os::unix::io::RawFd;
 /// A raw handle on an object the protocol passes between peers.

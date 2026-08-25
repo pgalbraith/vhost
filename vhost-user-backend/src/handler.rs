@@ -477,14 +477,11 @@ where
             .get(index as usize)
             .ok_or(VhostUserError::InvalidParam)?;
 
-        // If the vring already has a kick descriptor registered with the epoll, unregister it
-        // before replacing it. `SET_VRING_KICK` is not guaranteed to arrive only once per vring
-        // lifetime, so without this a live, registered descriptor can be dropped here. Closing a
-        // registered descriptor without unregistering it first is silently safe on Linux — epoll
-        // implicitly drops a closed fd from every interest list — but is undefined behavior on
-        // Windows, where a registered handle must be explicitly unregistered before it is closed
-        // (see `vmm_sys_util::epoll::Epoll::ctl`'s docs; its wait callback can still reference the
-        // handle).
+        // Unregister any existing kick descriptor before replacing it. SET_VRING_KICK can arrive
+        // more than once per vring, so a live, registered descriptor could otherwise be dropped
+        // here — harmless on Linux (epoll drops a closed fd from every interest list on its own),
+        // but undefined behavior on Windows, where a registered handle must be unregistered
+        // before it's closed (see `vmm_sys_util::epoll::Epoll::ctl` docs).
         if let Some(old_kick) = vring.get_ref().get_kick() {
             let old_raw = raw_descriptor(old_kick);
             for (thread_index, queues_mask) in self.queues_per_thread.iter().enumerate() {
@@ -507,11 +504,9 @@ where
         // such as that proposed by Rust RFC #3128.
         vring.set_kick(file);
 
-        // The first kick descriptor to arrive marks the vring ready. Every kick change beyond
-        // that — a later replacement on an already-ready vring — still needs
-        // `update_vring_registration` to register the *new* descriptor if the vring is enabled;
-        // without this `else`, replacing a live kick would leave the new one unregistered and
-        // silently stop kick delivery on that vring, on any platform.
+        // The first kick marks the vring ready and registers it. A later replacement on an
+        // already-ready vring still needs `update_vring_registration` for the new descriptor —
+        // without this `else`, kick delivery on that vring would silently stop.
         if self.vring_needs_init(vring) {
             self.initialize_vring(vring, index)?;
         } else {
@@ -922,13 +917,9 @@ mod tests {
         assert_eq!(events, 1, "Backend SHOULD have been kicked after enabling");
     }
 
-    // Regression test for a `set_vring_kick` bug found while porting this crate to Windows:
-    // replacing a vring's kick descriptor while the vring was already ready and enabled dropped
-    // the old, still-registered descriptor without unregistering it first (undefined behavior on
-    // Windows, where a registered handle must be explicitly unregistered before it is closed —
-    // harmless on Linux), and never registered the *new* descriptor at all, since
-    // `vring_needs_init()` only re-registers on the vring's first-ever kick. The second half was
-    // a real, platform-independent bug: kicking the new descriptor was silently ignored.
+    // Regression test: replacing a live, registered kick descriptor used to drop the old one
+    // without unregistering it (UB on Windows, harmless on Linux) and never register the new
+    // one, so kicks on the replacement were silently ignored on both platforms.
     #[test]
     fn test_replace_live_kick() {
         let mem = GuestMemoryAtomic::new(
@@ -953,8 +944,8 @@ mod tests {
             .unwrap();
         handler.set_vring_enable(vring_index as u32, true).unwrap();
 
-        // The vring is now ready and enabled, so its kick descriptor is live in the epoll.
-        // Replace it with a second one — the scenario `set_vring_kick`'s fix above exists for.
+        // Vring is now ready and enabled, kick descriptor live in the epoll. Replace it — the
+        // scenario the fix above exists for.
         let (second_consumer, second_notifier) =
             new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
         #[cfg(unix)]

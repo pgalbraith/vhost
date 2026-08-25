@@ -3,19 +3,17 @@
 
 //! Windows half of [`Endpoint`]: objects are passed by name in a trailer on the message payload.
 //!
-//! The control channel is the same `AF_UNIX` byte stream as on POSIX, and no extra framing is
-//! needed: the header's `size` field covers the name trailer, so a message and the names it carries
-//! arrive together. What does change is *when* the objects become available. On POSIX they are
-//! ancillary data on the packet carrying the header, so `recv_header()` returns them; here they sit
-//! at the end of the payload, so the payload has to be read in full before the header can be handed
-//! over. `recv_header()` therefore reads the whole message, resolves the names, and keeps the
-//! remaining payload in `Endpoint::pending` for the `recv_*` calls that follow — which is exactly
-//! the order in which callers already use this API.
+//! Same `AF_UNIX` byte stream as POSIX, no extra framing needed — the header's `size` covers the
+//! trailer, so message and names arrive together. What changes is *when* objects become available:
+//! on POSIX they ride with the header as ancillary data, but here they sit at the payload's end, so
+//! the whole message must be read before the header can be handed back. `recv_header()` does that:
+//! reads the message, resolves the names, and buffers the rest in `Endpoint::pending` for the
+//! `recv_*` calls that follow.
 //!
-//! Callers see a message identical to the one a POSIX peer would have sent: the trailer is removed
-//! from the payload and from the header's `size`.
+//! Callers see the same message a POSIX peer would have sent — trailer stripped from both payload
+//! and header `size`.
 //!
-//! See the [`win32`](super::super::win32) module for the wire format and why it exists.
+//! See [`win32`](super::super::win32) for the wire format and why it exists.
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};

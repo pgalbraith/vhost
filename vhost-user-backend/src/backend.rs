@@ -27,10 +27,9 @@ use vhost::vhost_user::message::{
     VhostTransferStateDirection, VhostTransferStatePhase, VhostUserProtocolFeatures,
     VhostUserShMemConfig, VhostUserSharedMsg,
 };
-// `Backend` and `GpuBackend` are established by handing a socket over the vhost-user connection,
-// which the Windows transport cannot do, and both belong to protocol features the front-end masks
-// there (`BACKEND_REQ`/`BACKEND_SEND_FD` and the GPU channel). See `vhost::vhost_user`'s own
-// platform split.
+// `Backend`/`GpuBackend` are set up by handing a socket over the connection, which Windows can't
+// do; both belong to protocol features (`BACKEND_REQ`/`BACKEND_SEND_FD`, the GPU channel) masked
+// there. See `vhost::vhost_user`'s own platform split.
 #[cfg(unix)]
 use vhost::vhost_user::Backend;
 use vm_memory::bitmap::Bitmap;

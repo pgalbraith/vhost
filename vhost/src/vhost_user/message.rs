@@ -73,12 +73,12 @@ pub(super) trait Req:
 {
     /// Number and kind of Win32 named-object records a request of this type carries as a trailer.
     ///
-    /// This is the Windows counterpart of "how many descriptors does this request attach", and like
-    /// the `SCM_RIGHTS` count on POSIX it is implied by the request rather than sent on the wire.
-    /// `payload` is the message payload including the trailer; the count is always derivable from
-    /// its head. The returned kind is meaningless when the count is zero.
+    /// Windows counterpart of "how many descriptors does this request attach" — implied by the
+    /// request, not sent on the wire, same as the `SCM_RIGHTS` count on POSIX. `payload` includes
+    /// the trailer; the count is always derivable from its head. Kind is meaningless when the
+    /// count is zero.
     ///
-    /// See the [`win32`](super::win32) module for the wire format.
+    /// See [`win32`](super::win32) for the wire format.
     #[cfg(windows)]
     fn win32_name_trailer(_code: Self, _payload: &[u8]) -> Result<(usize, Win32ObjectKind)> {
         Ok((0, Win32ObjectKind::Section))
@@ -224,10 +224,9 @@ impl Req for FrontendReq {
         };
 
         match code {
-            // One section object per memory region, named in the same order as the region records.
-            // The region count is at the head of the payload, and is the attached-descriptor count
-            // on POSIX too. Several regions naming the same section is normal and corresponds to
-            // several regions sharing one memfd.
+            // One section per region, in region order. Region count is at the payload head — same
+            // as the POSIX descriptor count. Several regions naming one section is normal: they
+            // share a memfd.
             FrontendReq::SET_MEM_TABLE => {
                 Ok((head_u32(payload)? as usize, Win32ObjectKind::Section))
             }
@@ -239,9 +238,9 @@ impl Req for FrontendReq {
                 let nofd = head_u64(payload)? & VHOST_USER_VRING_NOFD_MASK != 0;
                 Ok((usize::from(!nofd), Win32ObjectKind::Event))
             }
-            // Everything else that attaches a descriptor on POSIX belongs to a protocol feature
-            // that is not negotiated on Windows (logging, inflight tracking, the backend request
-            // channel, device state and shared objects), so no trailer is expected.
+            // Everything else that attaches a descriptor on POSIX (logging, inflight tracking,
+            // backend-req channel, device state, shared objects) is a feature not negotiated on
+            // Windows — no trailer.
             _ => Ok((0, Win32ObjectKind::Section)),
         }
     }
@@ -656,15 +655,13 @@ impl VhostUserMemoryRegion {
 
     /// Creates mmap region from Self.
     ///
-    /// The Windows transport delivers guest memory as the *name* of a section, which
-    /// [`win32::take_named_objects`](super::win32::take_named_objects) opens with
-    /// `OpenFileMappingA`. What arrives here is therefore already a section object, and must be
-    /// mapped rather than used to create one: `MmapRegion::from_file` calls `CreateFileMappingA`,
-    /// which requires a *file* handle and rejects a section with `ERROR_INVALID_HANDLE`.
+    /// The Windows transport delivers guest memory as a section name, opened via
+    /// [`win32::take_named_objects`](super::win32::take_named_objects) with `OpenFileMappingA` —
+    /// so `section` is already a section object, not a file. `MmapRegion::from_file` would call
+    /// `CreateFileMappingA` on it and fail with `ERROR_INVALID_HANDLE`; map it directly instead.
     ///
-    /// The `File` wrapper is only an owning handle wrapper — see `open_named_object` — so it is
-    /// borrowed for the mapping and then dropped. That is safe: Windows keeps a section alive for
-    /// as long as any view of it exists, so closing the handle does not invalidate the mapping.
+    /// `section` is just an owning handle wrapper (see `open_named_object`), borrowed here and
+    /// then dropped — safe, since Windows keeps a section alive as long as any view exists.
     #[cfg(windows)]
     pub fn mmap_region<B: NewBitmap>(&self, section: File) -> Result<MmapRegion<B>> {
         MmapRegion::<B>::from_section(&section, self.mmap_offset, self.memory_size as usize)

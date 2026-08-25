@@ -9,18 +9,16 @@ members = [
 [workspace.dependencies]
 virtio-bindings = "0.2.7"
 virtio-queue = "0.18.0"
-# `default-features = false` here so member crates can opt out of vm-memory's default
-# `rawfd` feature, which is a hard `compile_error!()` on Windows targets.
+# default-features off: rawfd is a hard compile_error!() on Windows. Member
+# crates re-enable it for unix.
 vm-memory = { version = "0.18.0", default-features = false }
 vmm-sys-util = "0.15.0"
 
-# Pre-PR scaffolding: neither fix below is published yet. Pinned by git rev so a standalone
-# clone of this repo builds on Windows without extra local setup, matching how the sibling
-# virtiofsd workspace pins the same commit in its own manifest. Cargo only honors a `[patch]`
-# section from the top-level manifest of whatever's being built, so this has no effect on
-# anyone consuming `vhost`/`vhost-user-backend` as a dependency — only on building this repo
-# directly. Remove before submitting upstream; the two fixes are on
-# https://github.com/pgalbraith/rust-vmm's `windows-support` branch, not yet in a PR either.
+# Pre-PR scaffolding: pins unpublished fixes by git rev so a standalone clone builds on Windows
+# without extra setup. `[patch]` only applies from the top-level manifest of what's being built,
+# so this has no effect on consumers of these crates — only on building this repo directly.
+# Remove before submitting upstream. Fixes are on pgalbraith/rust-vmm's `windows-support` branch,
+# not yet in a PR.
 [patch.crates-io]
 vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "ff7bbaf12f9faad209b15ad773fe7cda02a1d100" }
 vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "ff7bbaf12f9faad209b15ad773fe7cda02a1d100" }

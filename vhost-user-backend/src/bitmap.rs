@@ -273,10 +273,9 @@ impl MmapLogReg {
     }
 }
 
-// `VHOST_USER_PROTOCOL_F_LOG_SHMFD` is masked by the vhost-user front-end on Windows (there is no
-// named-object equivalent of the shared dirty-page log in the Windows transport), so the frontend
-// never sends `SET_LOG_BASE`, and this is never called in practice. The method still needs a body
-// to satisfy `MemRegionBitmap`, which is why this returns an error rather than being cfg'd away.
+// Masked on Windows: no named-object equivalent for the shared dirty-page log, so the front-end
+// never sends `SET_LOG_BASE` and this is never called. Still needs a body to satisfy
+// `MemRegionBitmap`, hence the error return instead of cfg'ing it away.
 #[cfg(windows)]
 impl MmapLogReg {
     pub(crate) fn from_file(_file: &File, _offset: u64, _len: u64) -> io::Result<Self> {

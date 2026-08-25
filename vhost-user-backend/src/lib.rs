@@ -436,10 +436,9 @@ mod tests {
             // Check that no exit events got triggered yet.
             //
             // Windows' `consume()` is intentionally lossy (see `vmm_sys_util::event`'s Windows
-            // docs): it never blocks and always returns `Ok(())`, so unlike a nonblocking read on
-            // an unsignaled Linux eventfd, there is no way to observe "not yet signaled" through
-            // this API there. Only the positive check below — that an exit event that really was
-            // raised is observable — has a Windows equivalent.
+            // docs) — never blocks, always returns `Ok(())` — so there's no way to observe "not
+            // yet signaled" there like a nonblocking read on an unsignaled Linux eventfd. Only the
+            // positive check below has a Windows equivalent.
             #[cfg(unix)]
             for thread_id in 0..backend.queues_per_thread().len() {
                 let fd = backend.exit_event(thread_id).unwrap();

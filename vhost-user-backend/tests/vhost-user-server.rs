@@ -1,7 +1,7 @@
-// This end-to-end test exercises a Rust vhost-user *frontend* (`vhost::vhost_user::Frontend`)
-// talking to this crate's backend. There is no Rust frontend consumer on Windows — QEMU is the
-// only frontend there, reached over the named-object transport in the `vhost` crate, not through
-// this Rust API — so `Frontend`/`VhostUserFrontend` are unix-only, and so is this whole test.
+// Exercises a Rust vhost-user *frontend* (`vhost::vhost_user::Frontend`) against this crate's
+// backend. No Rust frontend on Windows — QEMU is the only frontend there, reached over the
+// named-object transport, not this API — so `Frontend`/`VhostUserFrontend` are unix-only, and so
+// is this test.
 #![cfg(unix)]
 
 use std::fs::File;

@@ -33,9 +33,7 @@ libc = "0.2.39"
 uuid = { version = "1.11.0", default-features = false, features=["v4", "fast-rng"] }
 
 vmm-sys-util = { workspace = true }
-# `default-features = false` drops vm-memory's default `rawfd` feature, which is a hard
-# `compile_error!()` on Windows targets. It is re-enabled for unix below so that behaviour
-# on existing platforms is unchanged.
+# rawfd is a hard compile_error!() on Windows; dropped here, re-enabled for unix below.
 vm-memory = { workspace = true, default-features = false, features = ["backend-mmap"] }
 
 [target.'cfg(unix)'.dependencies]
