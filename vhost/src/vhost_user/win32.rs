@@ -42,7 +42,10 @@ pub const VHOST_USER_WIN32_NAME_SIZE: usize = 64;
 pub enum Win32ObjectKind {
     /// A section object (file mapping) backing a guest memory region.
     Section,
-    /// A manual-reset event object used for vring kick/call/err signalling.
+    /// An event object used for vring kick/call/err signalling. Reset mode
+    /// follows the waiter (see the interop spec): kick events are
+    /// auto-reset and consumed by this side's waits; call/err events are
+    /// manual-reset and only ever signalled from this side.
     Event,
 }
 
@@ -86,7 +89,17 @@ fn open_named_object(kind: Win32ObjectKind, record: &[u8]) -> Result<File> {
         match kind {
             Win32ObjectKind::Section => OpenFileMappingA(FILE_MAP_ALL_ACCESS, 0, record.as_ptr()),
             Win32ObjectKind::Event => {
-                OpenEventA(SYNCHRONIZE | EVENT_MODIFY_STATE, 0, record.as_ptr())
+                // EVENT_QUERY_STATE (not exposed outside windows-sys's Wdk
+                // tree) lets vmm-sys-util's debug-build Epoll guard verify
+                // the event is auto-reset via NtQueryEvent; without it the
+                // guard panics on an unverifiable kick. A frontend that
+                // ever tightens its event DACL must keep granting it.
+                const EVENT_QUERY_STATE: u32 = 0x0001;
+                OpenEventA(
+                    SYNCHRONIZE | EVENT_MODIFY_STATE | EVENT_QUERY_STATE,
+                    0,
+                    record.as_ptr(),
+                )
             }
         }
     };
@@ -130,15 +143,18 @@ mod tests {
         rec
     }
 
-    /// A manual-reset event created under `name`, so a record naming it can be opened.
+    /// An auto-reset event created under `name` (the kick contract's mode),
+    /// so a record naming it can be opened.
     fn event_named(name: &str) -> HANDLE {
         let cname = std::ffi::CString::new(name).unwrap();
         // SAFETY: `cname` is a valid NUL-terminated string for the duration of the call.
-        let h = unsafe { CreateEventA(std::ptr::null(), 1, 0, cname.as_ptr().cast()) };
+        let h = unsafe { CreateEventA(std::ptr::null(), 0, 0, cname.as_ptr().cast()) };
         assert!(!h.is_null());
         h
     }
 
+    /// NB: on an auto-reset event a `true` answer consumes the signal;
+    /// each test checks a signaled event at most once.
     fn is_signaled(f: &File) -> bool {
         // SAFETY: the handle is open for the lifetime of `f`.
         match unsafe { WaitForSingleObject(f.as_raw_handle() as HANDLE, 0) } {

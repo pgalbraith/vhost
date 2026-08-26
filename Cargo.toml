@@ -17,8 +17,8 @@ vmm-sys-util = "0.15.0"
 # Pre-PR scaffolding: pins unpublished fixes by git rev so a standalone clone builds on Windows
 # without extra setup. `[patch]` only applies from the top-level manifest of what's being built,
 # so this has no effect on consumers of these crates — only on building this repo directly.
-# Remove before submitting upstream. Fixes are on pgalbraith/rust-vmm's `windows-support` branch,
+# Remove before submitting upstream. Fixes are on pgalbraith/rust-vmm's `windows-raw` branch,
 # not yet in a PR.
 [patch.crates-io]
-vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "8298de765aaf2b835a9e8e7ab2674486de1e8048" }
-vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "8298de765aaf2b835a9e8e7ab2674486de1e8048" }
+vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "836a07826dd90258ba2992d255ec1fafb94de23e" }
+vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "836a07826dd90258ba2992d255ec1fafb94de23e" }
