@@ -25,7 +25,7 @@ use std::fs::File;
 use std::os::windows::io::FromRawHandle;
 
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-use windows_sys::Win32::System::Memory::{OpenFileMappingA, FILE_MAP_ALL_ACCESS};
+use windows_sys::Win32::System::Memory::{OpenFileMappingA, FILE_MAP_READ, FILE_MAP_WRITE};
 use windows_sys::Win32::System::Threading::{OpenEventA, EVENT_MODIFY_STATE};
 
 use super::{Error, Result};
@@ -87,7 +87,13 @@ fn open_named_object(kind: Win32ObjectKind, record: &[u8]) -> Result<File> {
     // the duration of the call.
     let handle = unsafe {
         match kind {
-            Win32ObjectKind::Section => OpenFileMappingA(FILE_MAP_ALL_ACCESS, 0, record.as_ptr()),
+            Win32ObjectKind::Section => {
+                // Read/write mapping access only: everything a guest-memory
+                // view needs, and nothing a compromised back-end could use
+                // to extend the section or rewrite its security descriptor
+                // (no SECTION_EXTEND_SIZE, no WRITE_DAC).
+                OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, 0, record.as_ptr())
+            }
             Win32ObjectKind::Event => {
                 // EVENT_QUERY_STATE (not exposed outside windows-sys's Wdk
                 // tree) lets vmm-sys-util's debug-build Epoll guard verify
