@@ -20,5 +20,5 @@ vmm-sys-util = "0.15.0"
 # Remove before submitting upstream. Fixes are on pgalbraith/rust-vmm's `windows-raw` branch,
 # not yet in a PR.
 [patch.crates-io]
-vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "836a07826dd90258ba2992d255ec1fafb94de23e" }
-vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "836a07826dd90258ba2992d255ec1fafb94de23e" }
+vm-memory = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "22bdae1d0f309ae3080529c8d90a6e20c9db99de" }
+vmm-sys-util = { git = "https://github.com/pgalbraith/rust-vmm.git", rev = "22bdae1d0f309ae3080529c8d90a6e20c9db99de" }
