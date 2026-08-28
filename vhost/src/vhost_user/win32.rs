@@ -4,62 +4,44 @@
 //! Windows replacement for `SCM_RIGHTS` descriptor passing.
 //!
 //! POSIX hands over guest-memory descriptors and vring kick/call/err notifications as `SCM_RIGHTS`
-//! ancillary data. Windows has no equivalent: moving a `HANDLE` between processes needs
-//! `DuplicateHandle`, which requires the peer's process id up front, but vhost-user's backend
-//! accepts any process that connects to the socket.
+//! ancillary data. Windows sockets carry no ancillary data at all, so the transport moves kernel
+//! objects with `DuplicateHandle` instead: before sending, the frontend duplicates each object into
+//! *this* process and puts the resulting handle value in the message.
 //!
-//! So the Windows transport passes *names* of Win32 kernel objects instead of handles. The owning
-//! side creates the object named in the `Local\` namespace; wherever POSIX attaches K descriptors
-//! to a message, Windows appends K fixed-size name records to the payload:
+//! Wherever POSIX attaches K descriptors to a message, Windows appends K handle records to the
+//! payload:
 //!
-//! * each record is [`VHOST_USER_WIN32_NAME_SIZE`] bytes, NUL-terminated and NUL-padded;
-//! * the header's `size` field includes the trailer, so records travel inside the normal payload
-//!   with no extra framing;
+//! * each record is [`VHOST_USER_WIN32_HANDLE_RECORD_SIZE`] bytes, a handle value already valid
+//!   here;
+//! * the header's `size` field includes the trailer, so message and records arrive together with no
+//!   extra framing;
 //! * there's no count field on the wire — K is implied by the request, same as the `SCM_RIGHTS`
-//!   descriptor count on POSIX (see [`super::message::Req::win32_name_trailer`]).
+//!   descriptor count on POSIX (see [`super::message::Req::win32_handle_trailer`]).
 //!
-//! Names are opaque: the peer mints them and may change how, so they're passed to Win32 exactly as
-//! received, never parsed, validated, or re-encoded here.
+//! This side owns each handle it receives and closes it when done, exactly as a POSIX backend
+//! closes a received descriptor. Nothing else is required of a backend: it never opens, names, or
+//! duplicates anything, and the frontend needs no cooperation from it to hand over an object.
+//!
+//! See "Windows platform support" in QEMU's `docs/interop/vhost-user.rst` for the full binding.
 
 use std::fs::File;
 use std::os::windows::io::FromRawHandle;
 
-use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
-use windows_sys::Win32::System::Memory::{OpenFileMappingA, FILE_MAP_READ, FILE_MAP_WRITE};
-use windows_sys::Win32::System::Threading::{OpenEventA, EVENT_MODIFY_STATE};
+use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE};
 
 use super::{Error, Result};
 
-/// Size of a single name record in a message trailer, matching `VHOST_USER_WIN32_NAME_SIZE` on the
-/// frontend side.
-pub const VHOST_USER_WIN32_NAME_SIZE: usize = 64;
+/// Size of a single handle record in a message trailer, matching
+/// `VHOST_USER_WIN32_HANDLE_RECORD_SIZE` on the frontend side.
+pub const VHOST_USER_WIN32_HANDLE_RECORD_SIZE: usize = 8;
 
-/// The kind of Win32 kernel object a name record refers to.
-///
-/// The kind is a property of the request, not of the record, so it is decided by
-/// [`super::message::Req::win32_name_trailer`] rather than read off the wire.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Win32ObjectKind {
-    /// A section object (file mapping) backing a guest memory region.
-    Section,
-    /// An event object used for vring kick/call/err signalling. Reset mode
-    /// follows the waiter (see the interop spec): kick events are
-    /// auto-reset and consumed by this side's waits; call/err events are
-    /// manual-reset and only ever signalled from this side.
-    Event,
-}
-
-/// Split `count` trailing name records off `payload` and open the objects they name.
+/// Split `count` trailing handle records off `payload` and adopt the objects they name.
 ///
 /// Returns the payload with the trailer removed — that is, the payload as a POSIX peer would have
-/// sent it — together with the opened objects, in wire order.
-pub fn take_named_objects(
-    payload: &[u8],
-    count: usize,
-    kind: Win32ObjectKind,
-) -> Result<(&[u8], Vec<File>)> {
+/// sent it — together with the adopted objects, in wire order.
+pub fn take_handles(payload: &[u8], count: usize) -> Result<(&[u8], Vec<File>)> {
     let trailer_len = count
-        .checked_mul(VHOST_USER_WIN32_NAME_SIZE)
+        .checked_mul(VHOST_USER_WIN32_HANDLE_RECORD_SIZE)
         .ok_or(Error::InvalidMessage)?;
     let base_len = payload
         .len()
@@ -68,95 +50,81 @@ pub fn take_named_objects(
     let (base, trailer) = payload.split_at(base_len);
 
     let mut files = Vec::with_capacity(count);
-    for record in trailer.chunks_exact(VHOST_USER_WIN32_NAME_SIZE) {
-        files.push(open_named_object(kind, record)?);
+    for record in trailer.chunks_exact(VHOST_USER_WIN32_HANDLE_RECORD_SIZE) {
+        files.push(adopt_handle(record)?);
     }
 
     Ok((base, files))
 }
 
-/// Open the named object described by a single name record.
-fn open_named_object(kind: Win32ObjectKind, record: &[u8]) -> Result<File> {
-    // Already NUL-terminated within its bounds, so it's a valid C string as-is; without a NUL
-    // it'd run off the end of the buffer.
-    if !record.contains(&0) {
-        return Err(Error::InvalidMessage);
+/// Adopt the object described by a single handle record.
+fn adopt_handle(record: &[u8]) -> Result<File> {
+    // Native byte order, like every other field of the protocol.
+    let value = u64::from_le_bytes(record.try_into().map_err(|_| Error::InvalidMessage)?);
+    let handle = value as usize as HANDLE;
+
+    // A record naming something that is not a live handle here means the peer is not speaking this
+    // binding: a duplicate the frontend made is valid by construction. Refusing beats adopting a
+    // value that may alias an unrelated handle of ours, which we would later close. A handle of the
+    // wrong *kind* is not detected here; it fails when the object is used, as a wrong-type
+    // descriptor does on POSIX.
+    let mut flags = 0u32;
+    // SAFETY: querying an arbitrary handle value is safe; the call reports validity rather than
+    // trapping on a bad one.
+    if handle.is_null() || unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+        return Err(Error::Win32InvalidHandle(std::io::Error::last_os_error()));
     }
 
-    // SAFETY: `record` is NUL-terminated within its bounds as checked above, and stays borrowed for
-    // the duration of the call.
-    let handle = unsafe {
-        match kind {
-            Win32ObjectKind::Section => {
-                // Read/write mapping access only: everything a guest-memory
-                // view needs, and nothing a compromised back-end could use
-                // to extend the section or rewrite its security descriptor
-                // (no SECTION_EXTEND_SIZE, no WRITE_DAC).
-                OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, 0, record.as_ptr())
-            }
-            Win32ObjectKind::Event => {
-                // EVENT_QUERY_STATE (not exposed outside windows-sys's Wdk
-                // tree) lets vmm-sys-util's debug-build Epoll guard verify
-                // the event is auto-reset via NtQueryEvent; without it the
-                // guard panics on an unverifiable kick. A frontend that
-                // ever tightens its event DACL must keep granting it.
-                const EVENT_QUERY_STATE: u32 = 0x0001;
-                OpenEventA(
-                    SYNCHRONIZE | EVENT_MODIFY_STATE | EVENT_QUERY_STATE,
-                    0,
-                    record.as_ptr(),
-                )
-            }
-        }
-    };
-    if handle.is_null() {
-        return Err(Error::Win32ObjectOpen(std::io::Error::last_os_error()));
-    }
-
-    // SAFETY: `handle` is a valid kernel object handle we exclusively own.
+    // SAFETY: `handle` is a valid kernel object handle, duplicated into this process by the peer
+    // and owned by us from here on.
     //
-    // `File` is just an owning wrapper here — `Drop` calls `CloseHandle`, correct for both section
-    // and event objects — kept so the handler API matches POSIX, where an eventfd also arrives as
-    // a `File`. Callers convert to whatever they actually need.
+    // `File` is just an owning wrapper — `Drop` calls `CloseHandle`, correct for both section and
+    // event objects — kept so the handler API matches POSIX, where an eventfd also arrives as a
+    // `File`. Callers convert to whatever they actually need.
     Ok(unsafe { File::from_raw_handle(handle as _) })
 }
 
-// Golden wire vectors for the record format, pinned through the production parser above. The
-// sending side of the contract pins the identical vectors through its production formatter
-// (QEMU's tests/unit/test-win32-shareable.c); a change that breaks either test breaks the
-// other implementation.
+// The record format is the cross-implementation surface: QEMU formats these bytes and this parser
+// reads them. The vectors below pin the layout through the production parser; QEMU pins the
+// duplication primitive on its side (tests/unit/test-win32-shareable.c).
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows_sys::Win32::System::Threading::{CreateEventA, SetEvent, WaitForSingleObject};
+    use windows_sys::Win32::Foundation::{
+        DuplicateHandle, DUPLICATE_SAME_ACCESS, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateEventA, GetCurrentProcess, SetEvent, WaitForSingleObject,
+    };
 
-    /// Vector 1: an ordinary name.
-    const VECTOR_KICK_NAME: &str = "Local\\example-kick-0";
-
-    /// Vector 2: the longest name that fits — 63 characters, leaving exactly one byte for the
-    /// terminator.
-    const VECTOR_MAX_NAME: &str =
-        "Local\\012345678901234567890123456789012345678901234567890123456";
-
-    /// The record layout under test: the name, its NUL terminator, and zero padding out to the
-    /// fixed size.
-    fn record(name: &str) -> [u8; VHOST_USER_WIN32_NAME_SIZE] {
-        assert!(name.len() < VHOST_USER_WIN32_NAME_SIZE);
-        let mut rec = [0u8; VHOST_USER_WIN32_NAME_SIZE];
-        rec[..name.len()].copy_from_slice(name.as_bytes());
-        rec
-    }
-
-    /// An auto-reset event created under `name` (the kick contract's mode),
-    /// so a record naming it can be opened.
-    fn event_named(name: &str) -> HANDLE {
-        let cname = std::ffi::CString::new(name).unwrap();
-        // SAFETY: `cname` is a valid NUL-terminated string for the duration of the call.
-        let h = unsafe { CreateEventA(std::ptr::null(), 0, 0, cname.as_ptr().cast()) };
+    /// An auto-reset event (the kick contract's mode), unnamed as the binding requires.
+    fn event() -> HANDLE {
+        // SAFETY: all arguments are simple values; the result is checked.
+        let h = unsafe { CreateEventA(std::ptr::null(), 0, 0, std::ptr::null()) };
         assert!(!h.is_null());
         h
+    }
+
+    /// What the frontend does before sending: duplicate into the peer — here, ourselves — and put
+    /// the resulting value on the wire.
+    fn record(local: HANDLE) -> [u8; VHOST_USER_WIN32_HANDLE_RECORD_SIZE] {
+        let mut dup: HANDLE = std::ptr::null_mut();
+        // SAFETY: both process handles are the current-process pseudo handle, `local` is live, and
+        // `dup` is a valid out-pointer.
+        let ok = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                local,
+                GetCurrentProcess(),
+                &mut dup,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        assert!(ok != 0, "{}", std::io::Error::last_os_error());
+        (dup as usize as u64).to_le_bytes()
     }
 
     /// NB: on an auto-reset event a `true` answer consumes the signal;
@@ -171,16 +139,16 @@ mod tests {
     }
 
     #[test]
-    fn a_record_is_the_name_nul_padded() {
-        let created = event_named(VECTOR_KICK_NAME);
+    fn a_record_is_a_handle_value() {
+        let created = event();
         let mut payload = b"base payload".to_vec();
-        payload.extend_from_slice(&record(VECTOR_KICK_NAME));
+        payload.extend_from_slice(&record(created));
 
-        let (base, objects) = take_named_objects(&payload, 1, Win32ObjectKind::Event).unwrap();
+        let (base, objects) = take_handles(&payload, 1).unwrap();
         assert_eq!(base, b"base payload");
         assert_eq!(objects.len(), 1);
 
-        // The opened object is the created one: signaling the original shows up through it.
+        // The adopted object is the created one: signaling the original shows up through it.
         assert!(!is_signaled(&objects[0]));
         // SAFETY: `created` is a valid event handle.
         unsafe { SetEvent(created) };
@@ -188,62 +156,65 @@ mod tests {
     }
 
     #[test]
-    fn the_longest_name_exactly_fits() {
-        assert_eq!(VECTOR_MAX_NAME.len(), VHOST_USER_WIN32_NAME_SIZE - 1);
-        let _created = event_named(VECTOR_MAX_NAME);
-        let payload = record(VECTOR_MAX_NAME);
-
-        let (base, objects) = take_named_objects(&payload, 1, Win32ObjectKind::Event).unwrap();
-        assert!(base.is_empty());
-        assert_eq!(objects.len(), 1);
+    fn a_record_that_is_not_a_handle_is_refused() {
+        // The frontend cannot produce this; a peer that does is speaking something else.
+        let payload = 0xdead_beef_u64.to_le_bytes();
+        assert!(matches!(
+            take_handles(&payload, 1),
+            Err(Error::Win32InvalidHandle(_))
+        ));
     }
 
     #[test]
-    fn a_record_without_a_terminator_is_refused() {
-        // The sender cannot produce this (its formatter requires room for the NUL); a peer that
-        // does is speaking something other than the contract.
-        let payload = [b'X'; VHOST_USER_WIN32_NAME_SIZE];
+    fn a_null_handle_is_refused() {
+        let payload = 0u64.to_le_bytes();
         assert!(matches!(
-            take_named_objects(&payload, 1, Win32ObjectKind::Event),
-            Err(Error::InvalidMessage)
+            take_handles(&payload, 1),
+            Err(Error::Win32InvalidHandle(_))
         ));
     }
 
     #[test]
     fn a_payload_shorter_than_its_trailer_is_refused() {
-        let payload = [0u8; VHOST_USER_WIN32_NAME_SIZE - 1];
-        assert!(matches!(
-            take_named_objects(&payload, 1, Win32ObjectKind::Event),
-            Err(Error::InvalidMessage)
-        ));
-    }
-
-    #[test]
-    fn a_name_no_object_carries_is_refused() {
-        let payload = record("Local\\example-does-not-exist");
-        assert!(matches!(
-            take_named_objects(&payload, 1, Win32ObjectKind::Event),
-            Err(Error::Win32ObjectOpen(_))
-        ));
+        let payload = [0u8; VHOST_USER_WIN32_HANDLE_RECORD_SIZE - 1];
+        assert!(matches!(take_handles(&payload, 1), Err(Error::InvalidMessage)));
     }
 
     #[test]
     fn a_trailer_splits_records_in_order() {
-        let first = event_named("Local\\example-ram-0");
-        let _second = event_named("Local\\example-ram-1");
+        let first = event();
+        let second = event();
 
         let mut payload = Vec::new();
-        payload.extend_from_slice(&record("Local\\example-ram-0"));
-        payload.extend_from_slice(&record("Local\\example-ram-1"));
+        payload.extend_from_slice(&record(first));
+        payload.extend_from_slice(&record(second));
 
-        let (base, objects) = take_named_objects(&payload, 2, Win32ObjectKind::Event).unwrap();
+        let (base, objects) = take_handles(&payload, 2).unwrap();
         assert!(base.is_empty());
         assert_eq!(objects.len(), 2);
 
-        // Signal only the first-named object: order is observable, not assumed.
+        // Signal only the first object: order is observable, not assumed.
         // SAFETY: `first` is a valid event handle.
         unsafe { SetEvent(first) };
         assert!(is_signaled(&objects[0]));
         assert!(!is_signaled(&objects[1]));
+    }
+
+    #[test]
+    fn adopting_takes_ownership() {
+        let created = event();
+        let payload = record(created);
+
+        let (_, objects) = take_handles(&payload, 1).unwrap();
+        let adopted = objects[0].as_raw_handle() as HANDLE;
+
+        // Dropping the wrapper closes the duplicate, and only the duplicate: the frontend keeps its
+        // own handle, as an SCM_RIGHTS sender keeps its descriptor.
+        drop(objects);
+        let mut flags = 0u32;
+        // SAFETY: querying a stale handle value reports invalidity rather than trapping.
+        assert_eq!(unsafe { GetHandleInformation(adopted, &mut flags) }, 0);
+        // SAFETY: `created` is still ours.
+        assert_ne!(unsafe { GetHandleInformation(created, &mut flags) }, 0);
     }
 }

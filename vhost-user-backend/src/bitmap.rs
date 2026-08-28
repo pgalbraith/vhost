@@ -273,7 +273,7 @@ impl MmapLogReg {
     }
 }
 
-// Masked on Windows: no named-object equivalent for the shared dirty-page log, so the front-end
+// Masked on Windows: `VHOST_USER_PROTOCOL_F_LOG_SHMFD` is not negotiated there, so the front-end
 // never sends `SET_LOG_BASE` and this is never called. Still needs a body to satisfy
 // `MemRegionBitmap`, hence the error return instead of cfg'ing it away.
 #[cfg(windows)]

@@ -30,7 +30,8 @@ pub use self::connection::Listener;
 mod win32;
 
 // The frontend hands out the objects backing guest memory and vring notifications. On Windows
-// that's QEMU handing out named kernel objects, not this crate, so there's no frontend here.
+// that's QEMU duplicating kernel object handles into us, not this crate, so there's no frontend
+// here.
 #[cfg(all(unix, feature = "vhost-user-frontend"))]
 mod frontend;
 #[cfg(all(unix, feature = "vhost-user-frontend"))]
@@ -114,9 +115,9 @@ pub enum Error {
     FileTruncateError,
     /// memfd file seal errors
     MemFdSealError,
-    /// Failed to open a named Win32 object referenced by a message.
+    /// A message carried a handle record that is not a live handle in this process.
     #[cfg(windows)]
-    Win32ObjectOpen(std::io::Error),
+    Win32InvalidHandle(std::io::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -155,8 +156,8 @@ impl std::fmt::Display for Error {
                 "handler failed to apply seals to memfd during get_inflight_fd"
             ),
             #[cfg(windows)]
-            Error::Win32ObjectOpen(e) => {
-                write!(f, "failed to open a named Win32 object: {e}")
+            Error::Win32InvalidHandle(e) => {
+                write!(f, "message carried an invalid Win32 handle: {e}")
             }
         }
     }
@@ -190,9 +191,9 @@ impl Error {
             Error::FeatureMismatch => false,
             Error::ReqHandlerError(_) => false,
             Error::MemFdCreateError | Error::FileTruncateError | Error::MemFdSealError => false,
-            // The peer named an object we cannot open; reconnecting would not change that.
+            // The peer sent a handle value we cannot use; reconnecting would not change that.
             #[cfg(windows)]
-            Error::Win32ObjectOpen(_) => false,
+            Error::Win32InvalidHandle(_) => false,
         }
     }
 }

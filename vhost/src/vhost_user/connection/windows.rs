@@ -1,14 +1,15 @@
 // Copyright (C) 2026 Paul Galbraith. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Windows half of [`Endpoint`]: objects are passed by name in a trailer on the message payload.
+//! Windows half of [`Endpoint`]: objects arrive as handle records in a trailer on the message
+//! payload, duplicated into this process by the frontend before it sent the message.
 //!
 //! Same `AF_UNIX` byte stream as POSIX, no extra framing needed — the header's `size` covers the
-//! trailer, so message and names arrive together. What changes is *when* objects become available:
-//! on POSIX they ride with the header as ancillary data, but here they sit at the payload's end, so
-//! the whole message must be read before the header can be handed back. `recv_header()` does that:
-//! reads the message, resolves the names, and buffers the rest in `Endpoint::pending` for the
-//! `recv_*` calls that follow.
+//! trailer, so message and handles arrive together. What changes is *when* objects become
+//! available: on POSIX they ride with the header as ancillary data, but here they sit at the
+//! payload's end, so the whole message must be read before the header can be handed back.
+//! `recv_header()` does that: reads the message, adopts the handles, and buffers the rest in
+//! `Endpoint::pending` for the `recv_*` calls that follow.
 //!
 //! Callers see the same message a POSIX peer would have sent — trailer stripped from both payload
 //! and header `size`.
@@ -23,15 +24,16 @@ use std::{mem, slice};
 use vm_memory::ByteValued;
 
 use super::super::message::*;
-use super::super::win32::take_named_objects;
+use super::super::win32::take_handles;
 use super::super::{Error, Result};
 use super::{Endpoint, RawDescriptor};
 
 impl<H: MsgHeader> Endpoint<H> {
     /// Sends bytes from scatter-gather vectors over the socket.
     ///
-    /// Windows cannot attach objects to a message, so `fds` must be empty or absent; the protocol
-    /// names objects in the payload instead.
+    /// Windows sockets carry no ancillary data, so `fds` must be empty or absent. A backend has
+    /// nothing to send this way in any case: every message that would carry a handle back to the
+    /// frontend belongs to a feature not negotiated on Windows.
     ///
     /// # Return:
     /// * - number of bytes sent on success
@@ -79,7 +81,7 @@ impl<H: MsgHeader> Endpoint<H> {
     /// * - PartialMessage: received a partial message.
     /// * - InvalidMessage: received an invalid message.
     /// * - OversizedMsg: the header claims a payload larger than the protocol allows.
-    /// * - Win32ObjectOpen: a named object could not be opened.
+    /// * - Win32InvalidHandle: a handle record was not a live handle here.
     /// * - SocketError: other socket related errors.
     pub fn recv_header(&mut self) -> Result<(H, Option<Vec<File>>)> {
         self.pending.clear();
@@ -107,8 +109,8 @@ impl<H: MsgHeader> Endpoint<H> {
             return Err(Error::PartialMessage);
         }
 
-        let (count, kind) = hdr.win32_name_trailer(&payload)?;
-        let (base, files) = take_named_objects(&payload, count, kind)?;
+        let count = hdr.win32_handle_trailer(&payload)?;
+        let (base, files) = take_handles(&payload, count)?;
 
         // Hide the trailer from callers, so that the message they see is the one a POSIX peer would
         // have sent.
@@ -249,45 +251,31 @@ mod tests {
     use std::io::Write;
 
     use uds_windows::UnixStream;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
+    };
     use windows_sys::Win32::System::Memory::{CreateFileMappingA, PAGE_READWRITE};
-    use windows_sys::Win32::System::Threading::CreateEventA;
+    use windows_sys::Win32::System::Threading::{CreateEventA, GetCurrentProcess};
 
-    use super::super::super::win32::VHOST_USER_WIN32_NAME_SIZE;
     use super::*;
 
-    /// A named kernel object, kept alive for as long as a test needs the name to resolve.
-    struct NamedObject {
-        name: Vec<u8>,
-        handle: std::os::windows::io::RawHandle,
+    /// A kernel object standing in for one the frontend owns. Unnamed, as the binding requires:
+    /// the peer only ever gets to it through a duplicated handle.
+    struct SharedObject {
+        handle: HANDLE,
     }
 
-    impl NamedObject {
-        /// Build a name that cannot collide with a concurrent test or another process.
-        fn name_for(kind: &str, seq: u32) -> Vec<u8> {
-            let mut name = format!(
-                r"Local\vhost-rs-test-{}-{}-{}",
-                std::process::id(),
-                kind,
-                seq
-            )
-            .into_bytes();
-            assert!(name.len() < VHOST_USER_WIN32_NAME_SIZE);
-            name.push(0);
-            name
-        }
-
-        fn event(seq: u32) -> Self {
-            let name = Self::name_for("evt", seq);
-            // SAFETY: `name` is NUL-terminated and outlives the call.
-            let handle = unsafe { CreateEventA(std::ptr::null(), 1, 0, name.as_ptr()) };
+    impl SharedObject {
+        fn event() -> Self {
+            // SAFETY: all arguments are simple values; the result is checked.
+            let handle = unsafe { CreateEventA(std::ptr::null(), 1, 0, std::ptr::null()) };
             assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
-            NamedObject { name, handle }
+            SharedObject { handle }
         }
 
-        fn section(seq: u32) -> Self {
-            let name = Self::name_for("ram", seq);
-            // SAFETY: `name` is NUL-terminated and outlives the call. A null file handle asks for a
-            // pagefile-backed section, which is what a shared guest RAM block is.
+        fn section() -> Self {
+            // SAFETY: a null file handle asks for a pagefile-backed section, which is what a
+            // shared guest RAM block is; the result is checked.
             let handle = unsafe {
                 CreateFileMappingA(
                     std::ptr::null_mut(),
@@ -295,25 +283,39 @@ mod tests {
                     PAGE_READWRITE,
                     0,
                     0x1000,
-                    name.as_ptr(),
+                    std::ptr::null(),
                 )
             };
             assert!(!handle.is_null(), "{}", std::io::Error::last_os_error());
-            NamedObject { name, handle }
+            SharedObject { handle }
         }
 
-        /// The name as it travels on the wire: NUL-terminated, NUL-padded to a fixed size.
+        /// What the frontend puts on the wire: the object duplicated into the peer — here, this
+        /// same process — as an 8-byte handle value.
         fn record(&self) -> Vec<u8> {
-            let mut record = self.name.clone();
-            record.resize(VHOST_USER_WIN32_NAME_SIZE, 0);
-            record
+            let mut dup: HANDLE = std::ptr::null_mut();
+            // SAFETY: both process handles are the current-process pseudo handle, `self.handle` is
+            // live, and `dup` is a valid out-pointer.
+            let ok = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    self.handle,
+                    GetCurrentProcess(),
+                    &mut dup,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            assert!(ok != 0, "{}", std::io::Error::last_os_error());
+            (dup as usize as u64).to_le_bytes().to_vec()
         }
     }
 
-    impl Drop for NamedObject {
+    impl Drop for SharedObject {
         fn drop(&mut self) {
             // SAFETY: `handle` is a live handle this struct owns.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+            unsafe { CloseHandle(self.handle) };
         }
     }
 
@@ -341,8 +343,8 @@ mod tests {
     }
 
     #[test]
-    fn vring_kick_opens_named_event() {
-        let event = NamedObject::event(0);
+    fn vring_kick_adopts_an_event() {
+        let event = SharedObject::event();
         let body = VhostUserU64::new(0);
         let (hdr, files, mut endpoint) = round_trip(
             FrontendReq::SET_VRING_KICK,
@@ -361,11 +363,11 @@ mod tests {
     }
 
     // With VHOST_USER_PROTOCOL_F_CONFIGURE_MEM_SLOTS negotiated the frontend stops sending
-    // SET_MEM_TABLE and grows the table one region at a time instead. ADD_MEM_REG names a section;
-    // REM_MEM_REG carries no object on either platform, so it has no trailer.
+    // SET_MEM_TABLE and grows the table one region at a time instead. ADD_MEM_REG carries a
+    // section; REM_MEM_REG carries no object on either platform, so it has no trailer.
     #[test]
-    fn add_mem_reg_opens_named_section() {
-        let section = NamedObject::section(2);
+    fn add_mem_reg_adopts_a_section() {
+        let section = SharedObject::section();
         let body = VhostUserSingleMemoryRegion::new(0, 0x1000, 0, 0);
         let (hdr, files, _) =
             round_trip(FrontendReq::ADD_MEM_REG, body.as_slice(), &section.record());
@@ -399,10 +401,10 @@ mod tests {
     }
 
     #[test]
-    fn mem_table_opens_one_section_per_region() {
-        // Both regions name the same section at different offsets, which is what a single shared
-        // guest RAM block looks like on the wire.
-        let section = NamedObject::section(1);
+    fn mem_table_adopts_one_section_per_region() {
+        // Both regions come from the same section at different offsets, which is what a single
+        // shared guest RAM block looks like on the wire: one duplicate per region.
+        let section = SharedObject::section();
         let regions = [
             VhostUserMemoryRegion::new(0, 0x800, 0, 0),
             VhostUserMemoryRegion::new(0x800, 0x800, 0, 0x800),
@@ -416,6 +418,7 @@ mod tests {
         }
         let trailer: Vec<u8> = regions.iter().flat_map(|_| section.record()).collect();
 
+
         let (hdr, files, _) = round_trip(FrontendReq::SET_MEM_TABLE, &body, &trailer);
 
         assert_eq!(hdr.get_size() as usize, body.len());
@@ -423,10 +426,8 @@ mod tests {
     }
 
     #[test]
-    fn unknown_name_is_reported() {
-        let mut record = br"Local\vhost-rs-test-does-not-exist".to_vec();
-        record.push(0);
-        record.resize(VHOST_USER_WIN32_NAME_SIZE, 0);
+    fn an_unusable_handle_is_reported() {
+        let record = 0xdead_beef_u64.to_le_bytes().to_vec();
         let body = VhostUserU64::new(0);
 
         let (mut frontend, backend) = UnixStream::pair().unwrap();
@@ -439,7 +440,7 @@ mod tests {
         let mut endpoint = Endpoint::<VhostUserMsgHeader<FrontendReq>>::from_stream(backend);
         assert!(matches!(
             endpoint.recv_header(),
-            Err(Error::Win32ObjectOpen(_))
+            Err(Error::Win32InvalidHandle(_))
         ));
     }
 

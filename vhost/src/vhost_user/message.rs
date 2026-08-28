@@ -25,8 +25,6 @@ use vm_memory::FileOffset;
 #[cfg(feature = "xen")]
 use vm_memory::{GuestAddress, MmapRange, MmapXenFlags};
 
-#[cfg(windows)]
-use super::win32::Win32ObjectKind;
 use super::{enum_value, Error, Result};
 use crate::VringConfigData;
 
@@ -71,17 +69,16 @@ pub const VHOST_USER_VRING_NOFD_MASK: u64 = 0x100;
 pub(super) trait Req:
     Clone + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Send + Sync + Into<u32> + TryFrom<u32>
 {
-    /// Number and kind of Win32 named-object records a request of this type carries as a trailer.
+    /// Number of Win32 handle records a request of this type carries as a trailer.
     ///
     /// Windows counterpart of "how many descriptors does this request attach" — implied by the
     /// request, not sent on the wire, same as the `SCM_RIGHTS` count on POSIX. `payload` includes
-    /// the trailer; the count is always derivable from its head. Kind is meaningless when the
-    /// count is zero.
+    /// the trailer; the count is always derivable from its head.
     ///
     /// See [`win32`](super::win32) for the wire format.
     #[cfg(windows)]
-    fn win32_name_trailer(_code: Self, _payload: &[u8]) -> Result<(usize, Win32ObjectKind)> {
-        Ok((0, Win32ObjectKind::Section))
+    fn win32_handle_trailer(_code: Self, _payload: &[u8]) -> Result<usize> {
+        Ok(0)
     }
 }
 
@@ -91,11 +88,11 @@ pub(super) trait MsgHeader: ByteValued + Copy + Default + VhostUserMsgValidator 
     /// The maximum size of a msg that can be encapsulated by this MsgHeader
     const MAX_MSG_SIZE: usize;
 
-    /// Number and kind of Win32 named-object records this message carries as a trailer.
+    /// Number of Win32 handle records this message carries as a trailer.
     ///
-    /// See [`Req::win32_name_trailer`].
+    /// See [`Req::win32_handle_trailer`].
     #[cfg(windows)]
-    fn win32_name_trailer(&self, payload: &[u8]) -> Result<(usize, Win32ObjectKind)>;
+    fn win32_handle_trailer(&self, payload: &[u8]) -> Result<usize>;
 
     /// Get the payload size recorded in the header.
     #[cfg(windows)]
@@ -103,8 +100,8 @@ pub(super) trait MsgHeader: ByteValued + Copy + Default + VhostUserMsgValidator 
 
     /// Set the payload size recorded in the header.
     ///
-    /// The Windows transport uses this to hide the name trailer from callers, so that a message is
-    /// presented exactly as a POSIX peer would have sent it.
+    /// The Windows transport uses this to hide the handle trailer from callers, so that a message
+    /// is presented exactly as a POSIX peer would have sent it.
     #[cfg(windows)]
     fn set_size(&mut self, size: u32);
 }
@@ -213,7 +210,7 @@ enum_value! {
 
 impl Req for FrontendReq {
     #[cfg(windows)]
-    fn win32_name_trailer(code: Self, payload: &[u8]) -> Result<(usize, Win32ObjectKind)> {
+    fn win32_handle_trailer(code: Self, payload: &[u8]) -> Result<usize> {
         let head_u32 = |payload: &[u8]| -> Result<u32> {
             let bytes = payload.get(..4).ok_or(Error::InvalidMessage)?;
             Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
@@ -225,23 +222,21 @@ impl Req for FrontendReq {
 
         match code {
             // One section per region, in region order. Region count is at the payload head — same
-            // as the POSIX descriptor count. Several regions naming one section is normal: they
-            // share a memfd.
-            FrontendReq::SET_MEM_TABLE => {
-                Ok((head_u32(payload)? as usize, Win32ObjectKind::Section))
-            }
-            FrontendReq::ADD_MEM_REG => Ok((1, Win32ObjectKind::Section)),
+            // as the POSIX descriptor count. Several regions sharing one section is normal: they
+            // come from one memfd, and the frontend duplicates its handle once per region.
+            FrontendReq::SET_MEM_TABLE => Ok(head_u32(payload)? as usize),
+            FrontendReq::ADD_MEM_REG => Ok(1),
             // A vring notification carries one event object, unless the payload says otherwise.
             FrontendReq::SET_VRING_KICK
             | FrontendReq::SET_VRING_CALL
             | FrontendReq::SET_VRING_ERR => {
                 let nofd = head_u64(payload)? & VHOST_USER_VRING_NOFD_MASK != 0;
-                Ok((usize::from(!nofd), Win32ObjectKind::Event))
+                Ok(usize::from(!nofd))
             }
             // Everything else that attaches a descriptor on POSIX (logging, inflight tracking,
             // backend-req channel, device state, shared objects) is a feature not negotiated on
             // Windows — no trailer.
-            _ => Ok((0, Win32ObjectKind::Section)),
+            _ => Ok(0),
         }
     }
 }
@@ -319,8 +314,8 @@ impl<R: Req> MsgHeader for VhostUserMsgHeader<R> {
     const MAX_MSG_SIZE: usize = MAX_MSG_SIZE;
 
     #[cfg(windows)]
-    fn win32_name_trailer(&self, payload: &[u8]) -> Result<(usize, Win32ObjectKind)> {
-        R::win32_name_trailer(self.get_code()?, payload)
+    fn win32_handle_trailer(&self, payload: &[u8]) -> Result<usize> {
+        R::win32_handle_trailer(self.get_code()?, payload)
     }
 
     #[cfg(windows)]
@@ -655,13 +650,13 @@ impl VhostUserMemoryRegion {
 
     /// Creates mmap region from Self.
     ///
-    /// The Windows transport delivers guest memory as a section name, opened via
-    /// [`win32::take_named_objects`](super::win32::take_named_objects) with `OpenFileMappingA` —
-    /// so `section` is already a section object, not a file. `MmapRegion::from_file` would call
+    /// The Windows transport delivers guest memory as a section handle duplicated in by the
+    /// frontend (see [`win32::take_handles`](super::win32::take_handles)) — so `section` is
+    /// already a section object, not a file. `MmapRegion::from_file` would call
     /// `CreateFileMappingA` on it and fail with `ERROR_INVALID_HANDLE`; map it directly instead.
     ///
-    /// `section` is just an owning handle wrapper (see `open_named_object`), borrowed here and
-    /// then dropped — safe, since Windows keeps a section alive as long as any view exists.
+    /// `section` is just an owning handle wrapper (see `adopt_handle`), borrowed here and then
+    /// dropped — safe, since Windows keeps a section alive as long as any view exists.
     #[cfg(windows)]
     pub fn mmap_region<B: NewBitmap>(&self, section: File) -> Result<MmapRegion<B>> {
         MmapRegion::<B>::from_section(&section, self.mmap_offset, self.memory_size as usize)

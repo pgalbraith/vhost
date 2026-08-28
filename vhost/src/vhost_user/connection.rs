@@ -5,9 +5,9 @@
 //!
 //! The vhost-user control channel is an `AF_UNIX` byte stream on every platform. What differs is
 //! how the objects the protocol hands over — guest memory, vring kick/call/err — travel across it:
-//! on POSIX they're descriptors attached via `SCM_RIGHTS`; Windows has no descriptor passing, so
-//! there they're named kernel objects whose names ride in the message payload. See
-//! [`win32`](super::win32) for that scheme.
+//! on POSIX they're descriptors attached via `SCM_RIGHTS`; Windows has no ancillary data, so there
+//! the frontend duplicates each object's handle into this process and the resulting handle values
+//! ride in the message payload. See [`win32`](super::win32) for that scheme.
 //!
 //! The platform-specific halves of [`Endpoint`] live in [`unix`] and [`windows`]; the rest is
 //! shared.
@@ -35,7 +35,7 @@ mod windows;
 
 /// A raw handle the send side attaches to a message for an object the protocol passes between
 /// peers. Windows has no descriptor-passing counterpart, so [`Endpoint::send_iovec`] rejects a
-/// non-empty slice there; objects are named in the payload instead.
+/// non-empty slice there; handle values ride in the payload instead.
 #[cfg(unix)]
 pub(super) type RawDescriptor = std::os::unix::io::RawFd;
 /// A raw handle on an object the protocol passes between peers.
