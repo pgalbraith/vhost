@@ -21,12 +21,9 @@ use super::backend::VhostUserBackend;
 use super::vring::VringT;
 
 /// A raw handle on an event source that can be registered with the epoll: a file descriptor on
-/// unix, a `HANDLE` on Windows.
-#[cfg(unix)]
-pub type RawDescriptor = RawFd;
-/// A raw handle on an event source that can be registered with the epoll.
-#[cfg(windows)]
-pub type RawDescriptor = RawHandle;
+/// unix, a `HANDLE` on Windows. The same platform split as everything else vhost hands around,
+/// so this is `vhost`'s alias, re-exported.
+pub use vhost::RawDescriptor;
 
 /// Borrow `consumer`'s raw descriptor, for registering or unregistering it with the epoll.
 pub(crate) fn raw_descriptor(consumer: &EventConsumer) -> RawDescriptor {

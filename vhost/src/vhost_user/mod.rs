@@ -310,35 +310,57 @@ use enum_value;
 #[cfg(all(test, feature = "vhost-user-backend"))]
 mod dummy_backend;
 
-#[cfg(all(
-    unix,
-    test,
-    feature = "vhost-user-frontend",
-    feature = "vhost-user-backend"
-))]
+#[cfg(all(test, feature = "vhost-user-frontend", feature = "vhost-user-backend"))]
 mod tests {
+    #[cfg(unix)]
     use message::VhostUserSharedMsg;
+    #[cfg(unix)]
     use std::fs::File;
+    #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
+    #[cfg(unix)]
     use std::os::unix::net::UnixStream;
+    #[cfg(windows)]
+    use std::os::windows::io::AsRawHandle;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+    #[cfg(unix)]
     use uuid::Uuid;
+    #[cfg(windows)]
+    use vmm_sys_util::eventfd::EventFd;
     use vmm_sys_util::rand::rand_alphanumerics;
+    #[cfg(windows)]
+    use vmm_sys_util::section::Section;
+    #[cfg(unix)]
     use vmm_sys_util::tempfile::TempFile;
+    #[cfg(windows)]
+    use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    #[cfg(windows)]
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     use super::dummy_backend::{DummyBackendReqHandler, VIRTIO_FEATURES};
     use super::message::*;
     use super::*;
     use crate::backend::VhostBackend;
-    use crate::{VhostUserDirtyLogRegion, VhostUserMemoryRegionInfo, VringConfigData};
+    #[cfg(unix)]
+    use crate::VhostUserDirtyLogRegion;
+    use crate::{VhostUserMemoryRegionInfo, VringConfigData};
 
     fn temp_path() -> PathBuf {
-        PathBuf::from(format!(
-            "/tmp/vhost_test_{}",
+        std::env::temp_dir().join(format!(
+            "vhost_test_{}",
             rand_alphanumerics(8).to_str().unwrap()
         ))
+    }
+
+    /// `Frontend::connect` with the platform-specific arguments filled in; these tests play both
+    /// ends in one process, so on Windows the "backend process" is this one.
+    fn connect_frontend<P: AsRef<Path>>(path: P, max_queue_num: u64) -> Frontend {
+        #[cfg(unix)]
+        return Frontend::connect(path, max_queue_num).unwrap();
+        #[cfg(windows)]
+        return Frontend::connect(path, max_queue_num, win32::current_process()).unwrap();
     }
 
     fn create_backend<P, S>(path: P, backend: Arc<S>) -> (Frontend, BackendReqHandler<S>)
@@ -348,7 +370,7 @@ mod tests {
     {
         let mut listener = Listener::new(&path, true).unwrap();
         let mut backend_listener = BackendListener::new(&mut listener, backend).unwrap();
-        let frontend = Frontend::connect(&path, 1).unwrap();
+        let frontend = connect_frontend(&path, 1);
         (frontend, backend_listener.accept().unwrap().unwrap())
     }
 
@@ -419,6 +441,10 @@ mod tests {
         mbar.wait();
     }
 
+    // POSIX flow: exercises the features the Windows binding leaves un-negotiated (inflight
+    // tracking, dirty logging, the backend channel, shared objects). The Windows flow is the
+    // same-named test below.
+    #[cfg(unix)]
     #[test]
     fn test_frontend_backend_process() {
         let mbar = Arc::new(Barrier::new(2));
@@ -608,92 +634,11 @@ mod tests {
         mbar.wait();
     }
 
-    #[test]
-    fn test_error_display() {
-        assert_eq!(format!("{}", Error::InvalidParam), "invalid parameters");
-        assert_eq!(
-            format!("{}", Error::InvalidOperation("reason")),
-            "invalid operation: reason"
-        );
-    }
-
-    #[test]
-    fn test_should_reconnect() {
-        assert!(Error::PartialMessage.should_reconnect());
-        assert!(Error::BackendInternalError.should_reconnect());
-        assert!(Error::FrontendInternalError.should_reconnect());
-        assert!(!Error::InvalidParam.should_reconnect());
-        assert!(!Error::InvalidOperation("reason").should_reconnect());
-        assert!(
-            !Error::InactiveFeature(VhostUserVirtioFeatures::PROTOCOL_FEATURES).should_reconnect()
-        );
-        assert!(!Error::InactiveOperation(VhostUserProtocolFeatures::all()).should_reconnect());
-        assert!(!Error::InvalidMessage.should_reconnect());
-        assert!(!Error::IncorrectFds.should_reconnect());
-        assert!(!Error::OversizedMsg.should_reconnect());
-        assert!(!Error::FeatureMismatch.should_reconnect());
-    }
-
-    #[test]
-    fn test_error_from_sys_util_error() {
-        let e: Error = vmm_sys_util::errno::Error::new(libc::EAGAIN).into();
-        if let Error::SocketRetry(e1) = e {
-            assert_eq!(e1.raw_os_error().unwrap(), libc::EAGAIN);
-        } else {
-            panic!("invalid error code conversion!");
-        }
-    }
-}
-
-// The Windows counterpart of the integration tests above: a Rust frontend driving a Rust backend
-// over one socket, both ends in one process, with the objects crossing as duplicated handles.
-// Scoped to what the Windows binding's first version negotiates — no inflight tracking, dirty
-// logging, backend channel, shared objects or device state.
-#[cfg(all(
-    windows,
-    test,
-    feature = "vhost-user-frontend",
-    feature = "vhost-user-backend"
-))]
-mod windows_tests {
-    use std::os::windows::io::AsRawHandle;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Barrier, Mutex};
-    use std::thread;
-
-    use vmm_sys_util::eventfd::EventFd;
-    use vmm_sys_util::rand::rand_alphanumerics;
-    use vmm_sys_util::section::Section;
-    use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
-
-    use super::dummy_backend::{DummyBackendReqHandler, VIRTIO_FEATURES};
-    use super::message::*;
-    use super::*;
-    use crate::backend::VhostBackend;
-    use crate::{VhostUserMemoryRegionInfo, VringConfigData};
-
-    fn temp_path() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "vhost_test_{}",
-            rand_alphanumerics(8).to_str().unwrap()
-        ))
-    }
-
-    fn create_backend<P, S>(path: P, backend: Arc<S>) -> (Frontend, BackendReqHandler<S>)
-    where
-        P: AsRef<Path>,
-        S: VhostUserBackendReqHandler,
-    {
-        let mut listener = Listener::new(&path, true).unwrap();
-        let mut backend_listener = BackendListener::new(&mut listener, backend).unwrap();
-        // Both ends are this process, so this process plays the backend for handle transfer.
-        let frontend = Frontend::connect(&path, 1, win32::current_process()).unwrap();
-        (frontend, backend_listener.accept().unwrap().unwrap())
-    }
-
-    /// The v1 startup flow end to end: ownership, feature negotiation, guest memory as section
-    /// handles, vring setup with event objects, config space, and incremental memory regions.
+    // Windows flow: the v1 startup end to end — ownership, feature negotiation, guest memory as
+    // section handles crossing as duplicated handles, vring setup with event objects, config
+    // space, and incremental memory regions. Scoped to what the Windows binding's first version
+    // negotiates; the POSIX flow is the same-named test above.
+    #[cfg(windows)]
     #[test]
     fn test_frontend_backend_process() {
         let mbar = Arc::new(Barrier::new(2));
@@ -799,5 +744,41 @@ mod windows_tests {
         // SAFETY: the received `File` keeps its handle open for the duration of the wait.
         let woken = unsafe { WaitForSingleObject(received.as_raw_handle() as HANDLE, 0) };
         assert_eq!(woken, WAIT_OBJECT_0);
+    }
+
+    #[test]
+    fn test_error_display() {
+        assert_eq!(format!("{}", Error::InvalidParam), "invalid parameters");
+        assert_eq!(
+            format!("{}", Error::InvalidOperation("reason")),
+            "invalid operation: reason"
+        );
+    }
+
+    #[test]
+    fn test_should_reconnect() {
+        assert!(Error::PartialMessage.should_reconnect());
+        assert!(Error::BackendInternalError.should_reconnect());
+        assert!(Error::FrontendInternalError.should_reconnect());
+        assert!(!Error::InvalidParam.should_reconnect());
+        assert!(!Error::InvalidOperation("reason").should_reconnect());
+        assert!(
+            !Error::InactiveFeature(VhostUserVirtioFeatures::PROTOCOL_FEATURES).should_reconnect()
+        );
+        assert!(!Error::InactiveOperation(VhostUserProtocolFeatures::all()).should_reconnect());
+        assert!(!Error::InvalidMessage.should_reconnect());
+        assert!(!Error::IncorrectFds.should_reconnect());
+        assert!(!Error::OversizedMsg.should_reconnect());
+        assert!(!Error::FeatureMismatch.should_reconnect());
+    }
+
+    #[test]
+    fn test_error_from_sys_util_error() {
+        let e: Error = vmm_sys_util::errno::Error::new(libc::EAGAIN).into();
+        if let Error::SocketRetry(e1) = e {
+            assert_eq!(e1.raw_os_error().unwrap(), libc::EAGAIN);
+        } else {
+            panic!("invalid error code conversion!");
+        }
     }
 }
