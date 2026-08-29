@@ -1,55 +1,105 @@
 // Copyright (C) 2026 Paul Galbraith. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Windows half of [`Endpoint`]: objects arrive as handle records in a trailer on the message
-//! payload, duplicated into this process by the frontend before it sent the message.
+//! Windows half of [`Endpoint`]: objects travel as handle records in a trailer on the message
+//! payload, `DuplicateHandle` standing in for `SCM_RIGHTS`.
 //!
 //! Same `AF_UNIX` byte stream as POSIX, no extra framing needed — the header's `size` covers the
 //! trailer, so message and handles arrive together. What changes is *when* objects become
 //! available: on POSIX they ride with the header as ancillary data, but here they sit at the
 //! payload's end, so the whole message must be read before the header can be handed back.
-//! `recv_header()` does that: reads the message, adopts the handles, and buffers the rest in
-//! `Endpoint::pending` for the `recv_*` calls that follow.
+//! `recv_header()` does that: reads the message, takes ownership of the handles, and buffers the
+//! rest in `Endpoint::pending` for the `recv_*` calls that follow.
+//!
+//! The frontend and backend halves of a connection differ, because every handle value on the wire
+//! is relative to the *backend* process. A frontend endpoint holds a handle to the backend
+//! process (`Endpoint::set_peer_process`); `send_iovec` duplicates each attached object into the
+//! backend through it and appends the records the backend will adopt as they are. A backend
+//! endpoint holds nothing extra and never sends objects: every message that would carry a handle
+//! back to the frontend belongs to a feature not negotiated on Windows.
 //!
 //! Callers see the same message a POSIX peer would have sent — trailer stripped from both payload
-//! and header `size`.
+//! and header `size`, objects delivered alongside as on POSIX.
 //!
 //! See [`win32`](super::super::win32) for the wire format and why it exists.
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
-use std::os::windows::io::{AsRawSocket, RawSocket};
+use std::os::windows::io::{AsHandle, AsRawSocket, OwnedHandle, RawSocket};
 use std::{mem, slice};
 
 use vm_memory::ByteValued;
 
 use super::super::message::*;
-use super::super::win32::take_handles;
+use super::super::win32::{close_in_peer, duplicate_into_peer, take_handles};
 use super::super::{Error, Result};
 use super::{Endpoint, RawDescriptor};
 
 impl<H: MsgHeader> Endpoint<H> {
-    /// Sends bytes from scatter-gather vectors over the socket.
+    /// Make this the frontend end of the connection: a handle to the backend process, with
+    /// `PROCESS_DUP_HANDLE` access, that objects are duplicated into on send and pulled out of on
+    /// receive. Held for the connection's lifetime.
+    pub fn set_peer_process(&mut self, process: OwnedHandle) {
+        self.peer_process = Some(process);
+    }
+
+    /// Sends bytes from scatter-gather vectors over the socket, handing over the objects in `fds`
+    /// through the message itself.
     ///
-    /// Windows sockets carry no ancillary data, so `fds` must be empty or absent. A backend has
-    /// nothing to send this way in any case: every message that would carry a handle back to the
-    /// frontend belongs to a feature not negotiated on Windows.
+    /// Windows sockets carry no ancillary data, so each object is duplicated into the peer process
+    /// and the resulting handle values are appended to the message as trailer records, with the
+    /// header's `size` grown to cover them. That needs the peer's process handle, which only the
+    /// frontend side holds (see `set_peer_process`); a backend has nothing to send this way in any
+    /// case, since every message that would carry a handle back to the frontend belongs to a
+    /// feature not negotiated on Windows.
+    ///
+    /// The returned count excludes the trailer, so callers can balance it against the bytes they
+    /// passed in, exactly as on POSIX where the descriptors are not part of the byte stream.
     ///
     /// # Return:
-    /// * - number of bytes sent on success
-    /// * - InvalidOperation: descriptors were attached to the message.
+    /// * - number of bytes sent, trailer not counted, on success
+    /// * - InvalidOperation: descriptors were attached without a peer process handle.
+    /// * - Win32HandleTransfer: a descriptor could not be duplicated into the peer.
     /// * - SocketBroken: the underline socket is broken.
     /// * - SocketError: other socket related errors.
     pub fn send_iovec(&mut self, iovs: &[&[u8]], fds: Option<&[RawDescriptor]>) -> Result<usize> {
-        if matches!(fds, Some(fds) if !fds.is_empty()) {
-            return Err(Error::InvalidOperation(
-                "attaching descriptors to a message is not supported on Windows",
-            ));
+        let handles = fds.unwrap_or_default();
+        let mut data = iovs.concat();
+        if handles.is_empty() {
+            self.sock.write_all(&data).map_err(Error::SocketError)?;
+            return Ok(data.len());
         }
 
-        let data = iovs.concat();
-        self.sock.write_all(&data).map_err(Error::SocketError)?;
-        Ok(data.len())
+        let Some(peer) = self.peer_process.as_ref() else {
+            return Err(Error::InvalidOperation(
+                "sending objects needs the backend process handle, which only the frontend holds",
+            ));
+        };
+        let peer = peer.as_handle();
+
+        // Every sender in `connection.rs` puts the full header first, so the `size` field to grow
+        // is at the front of `data`.
+        if data.len() < mem::size_of::<H>() {
+            return Err(Error::InvalidParam);
+        }
+
+        let trailer = duplicate_into_peer(peer, handles)?;
+
+        // SAFETY: `H` is `ByteValued` and `data` holds at least `size_of::<H>()` bytes of it.
+        let mut hdr: H = unsafe { std::ptr::read_unaligned(data.as_ptr() as *const H) };
+        hdr.set_size(hdr.get_size() + trailer.len() as u32);
+        data[..mem::size_of::<H>()].copy_from_slice(hdr.as_slice());
+
+        let sent = data.len();
+        data.extend_from_slice(&trailer);
+        if let Err(e) = self.sock.write_all(&data) {
+            // An SCM_RIGHTS send that fails delivers nothing. Duplication already happened, so
+            // restore that property by hand: take the handles back out of the peer, which was
+            // never told of them and could otherwise never release the objects.
+            close_in_peer(peer, &trailer);
+            return Err(Error::SocketError(e));
+        }
+        Ok(sent)
     }
 
     /// Read into `buf` until it is full or the peer stops sending, returning the number of bytes
@@ -110,7 +160,8 @@ impl<H: MsgHeader> Endpoint<H> {
         }
 
         let count = hdr.win32_handle_trailer(&payload)?;
-        let (base, files) = take_handles(&payload, count)?;
+        let peer = self.peer_process.as_ref().map(|p| p.as_handle());
+        let (base, files) = take_handles(peer, &payload, count)?;
 
         // Hide the trailer from callers, so that the message they see is the one a POSIX peer would
         // have sent.
@@ -418,7 +469,6 @@ mod tests {
         }
         let trailer: Vec<u8> = regions.iter().flat_map(|_| section.record()).collect();
 
-
         let (hdr, files, _) = round_trip(FrontendReq::SET_MEM_TABLE, &body, &trailer);
 
         assert_eq!(hdr.get_size() as usize, body.len());
@@ -445,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn attaching_descriptors_is_rejected() {
+    fn attaching_descriptors_needs_a_peer_process() {
         let (_frontend, backend) = UnixStream::pair().unwrap();
         let mut endpoint = Endpoint::<VhostUserMsgHeader<FrontendReq>>::from_stream(backend);
         let hdr = VhostUserMsgHeader::new(FrontendReq::SET_VRING_KICK, 0, 0);
@@ -454,5 +504,112 @@ mod tests {
             endpoint.send_header(&hdr, Some(&[std::ptr::null_mut()])),
             Err(Error::InvalidOperation(_))
         ));
+    }
+
+    /// A connected endpoint pair, the frontend end armed with the "backend process" handle —
+    /// this same process, so both ends can be driven from one test.
+    fn endpoint_pair() -> (
+        Endpoint<VhostUserMsgHeader<FrontendReq>>,
+        Endpoint<VhostUserMsgHeader<FrontendReq>>,
+    ) {
+        let (f, b) = UnixStream::pair().unwrap();
+        let mut frontend = Endpoint::<VhostUserMsgHeader<FrontendReq>>::from_stream(f);
+        frontend.set_peer_process(super::super::super::win32::current_process());
+        (frontend, Endpoint::from_stream(b))
+    }
+
+    fn is_signaled(handle: HANDLE) -> bool {
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        // SAFETY: the caller passes a live handle.
+        match unsafe { WaitForSingleObject(handle, 0) } {
+            WAIT_OBJECT_0 => true,
+            WAIT_TIMEOUT => false,
+            other => panic!("unexpected wait result {other:#x}"),
+        }
+    }
+
+    #[test]
+    fn frontend_hands_an_event_over_inside_the_message() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::SetEvent;
+
+        let (mut frontend, mut backend) = endpoint_pair();
+        let event = SharedObject::event();
+        let body = VhostUserU64::new(0);
+        let hdr = VhostUserMsgHeader::new(
+            FrontendReq::SET_VRING_KICK,
+            0,
+            mem::size_of::<VhostUserU64>() as u32,
+        );
+        frontend
+            .send_message(&hdr, &body, Some(&[event.handle as _]))
+            .unwrap();
+
+        // The backend sees the POSIX-shaped message with the object alongside — the endpoint
+        // grew `size` for the trailer on the way out and the receiver stripped it again.
+        let (rhdr, files) = backend.recv_header().unwrap();
+        assert_eq!(rhdr.get_size() as usize, mem::size_of::<VhostUserU64>());
+        let files = files.unwrap();
+        assert_eq!(files.len(), 1);
+
+        // The received object is the sent one, held through an independent handle.
+        assert!(!is_signaled(files[0].as_raw_handle() as HANDLE));
+        // SAFETY: `event.handle` is a live event handle.
+        unsafe { SetEvent(event.handle) };
+        assert!(is_signaled(files[0].as_raw_handle() as HANDLE));
+    }
+
+    #[test]
+    fn frontend_hands_a_section_over_per_region() {
+        let (mut frontend, mut backend) = endpoint_pair();
+        let section = SharedObject::section();
+        let regions = [
+            VhostUserMemoryRegion::new(0, 0x800, 0, 0),
+            VhostUserMemoryRegion::new(0x800, 0x800, 0, 0x800),
+        ];
+        let body = VhostUserMemory::new(regions.len() as u32);
+        let payload: Vec<u8> = regions.iter().flat_map(|r| r.as_slice().to_vec()).collect();
+        let hdr = VhostUserMsgHeader::new(
+            FrontendReq::SET_MEM_TABLE,
+            0,
+            (mem::size_of::<VhostUserMemory>() + payload.len()) as u32,
+        );
+        frontend
+            .send_message_with_payload(
+                &hdr,
+                &body,
+                &payload,
+                Some(&[section.handle as _, section.handle as _]),
+            )
+            .unwrap();
+
+        let (rhdr, files) = backend.recv_header().unwrap();
+        assert_eq!(
+            rhdr.get_size() as usize,
+            mem::size_of::<VhostUserMemory>() + payload.len()
+        );
+        assert_eq!(files.unwrap().len(), regions.len());
+    }
+
+    // A REPLY_ACK ack echoes the request code, so an ack for SET_VRING_KICK must not be read as
+    // carrying the record only the request has. Regression test for the reply guard in
+    // `MsgHeader::win32_handle_trailer`.
+    #[test]
+    fn frontend_reads_a_reply_ack_without_expecting_a_trailer() {
+        let (mut frontend, mut backend) = endpoint_pair();
+        let mut hdr = VhostUserMsgHeader::new(
+            FrontendReq::SET_VRING_KICK,
+            0,
+            mem::size_of::<VhostUserU64>() as u32,
+        );
+        hdr.set_reply(true);
+        let ack = VhostUserU64::new(0);
+        backend.send_message(&hdr, &ack, None).unwrap();
+
+        let (rhdr, body, files) = frontend.recv_body::<VhostUserU64>().unwrap();
+        assert!(rhdr.is_reply());
+        assert_eq!(body.value, 0);
+        assert!(files.is_none());
     }
 }

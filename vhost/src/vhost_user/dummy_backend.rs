@@ -39,6 +39,8 @@ impl DummyBackendReqHandler {
     }
 
     /// Set the shared memory configuration to be returned by `get_shmem_config`
+    // Only exercised by `backend_req_handler`'s POSIX-only tests.
+    #[cfg(unix)]
     pub fn set_shmem_config(&mut self, config: VhostUserShMemConfig) {
         self.acked_protocol_features |= VhostUserProtocolFeatures::SHMEM.bits();
         self.shmem_config = Some(config);

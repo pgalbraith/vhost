@@ -2,25 +2,58 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Traits and Struct for vhost-user frontend.
+//!
+//! On Windows a frontend must additionally hold a handle to the backend process, with
+//! `PROCESS_DUP_HANDLE` access: every object it hands over — guest memory, vring notifications —
+//! is duplicated into the backend through it. See [`Frontend::connect`] for where that handle may
+//! legitimately come from.
 
 use std::fs::File;
 use std::mem;
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+#[cfg(windows)]
+use uds_windows::UnixStream;
 use vm_memory::ByteValued;
 use vmm_sys_util::eventfd::EventFd;
 
-use super::connection::Endpoint;
+use super::connection::{Endpoint, RawDescriptor};
 use super::message::*;
 use super::{take_single_file, Error as VhostUserError, Result as VhostUserResult};
 use crate::backend::{
     VhostBackend, VhostUserDirtyLogRegion, VhostUserMemoryRegionInfo, VringConfigData,
 };
 use crate::{Error, Result};
+
+/// The raw descriptor an `EventFd` wraps: its fd on POSIX hosts, its event object handle on
+/// Windows hosts. Same shim as `raw_descriptor` in `vhost-user-backend`.
+fn raw_descriptor(fd: &EventFd) -> RawDescriptor {
+    #[cfg(unix)]
+    return fd.as_raw_fd();
+    #[cfg(windows)]
+    return fd.as_raw_handle();
+}
+
+/// Whether a caller-supplied descriptor is something that could be handed over at all: fds are
+/// non-negative, handles are non-null and not `INVALID_HANDLE_VALUE`. The real test is the OS
+/// accepting the descriptor at transfer time; this only catches the conventional "no descriptor"
+/// values early, as the POSIX-only `< 0` check always did.
+fn valid_descriptor(desc: RawDescriptor) -> bool {
+    #[cfg(unix)]
+    return desc >= 0;
+    #[cfg(windows)]
+    return !desc.is_null()
+        && !std::ptr::eq(desc, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+}
 
 /// Trait for vhost-user frontend to provide extra methods not covered by the VhostBackend yet.
 pub trait VhostUserFrontend: VhostBackend {
@@ -57,9 +90,16 @@ pub trait VhostUserFrontend: VhostBackend {
     fn set_config(&mut self, offset: u32, flags: VhostUserConfigFlags, buf: &[u8]) -> Result<()>;
 
     /// Setup backend communication channel.
+    ///
+    /// POSIX only: the channel is set up by passing a socket over the connection, and the Windows
+    /// binding never negotiates the feature — winsock sockets cannot be transferred by handle.
+    #[cfg(unix)]
     fn set_backend_request_fd(&mut self, fd: &dyn AsRawFd) -> Result<()>;
 
     /// Retrieve a given dma-buf fd from a given backend
+    ///
+    /// POSIX only: DMA-BUF sharing has no Windows binding.
+    #[cfg(unix)]
     fn get_shared_object(&mut self, uuid: &VhostUserSharedMsg) -> Result<File>;
 
     /// Retrieve shared buffer for inflight I/O tracking.
@@ -69,7 +109,7 @@ pub trait VhostUserFrontend: VhostBackend {
     ) -> Result<(VhostUserInflight, File)>;
 
     /// Set shared buffer for inflight I/O tracking.
-    fn set_inflight_fd(&mut self, inflight: &VhostUserInflight, fd: RawFd) -> Result<()>;
+    fn set_inflight_fd(&mut self, inflight: &VhostUserInflight, fd: RawDescriptor) -> Result<()>;
 
     /// Query the maximum amount of memory slots supported by the backend.
     fn get_max_mem_slots(&mut self) -> Result<u64>;
@@ -85,6 +125,9 @@ pub trait VhostUserFrontend: VhostBackend {
 
     /// Begin transfer of internal state from/to the back-end
     /// for the purpose of migration.
+    ///
+    /// POSIX only: migration is not part of the Windows binding's first version.
+    #[cfg(unix)]
     fn set_device_state_fd(
         &self,
         direction: VhostTransferStateDirection,
@@ -95,6 +138,9 @@ pub trait VhostUserFrontend: VhostBackend {
     /// Inquire the back-end to report any potential errors
     /// that have occurred after transferring state from/to
     /// the back-end via vhost_set_device_state_fd().
+    ///
+    /// POSIX only, alongside [`VhostUserFrontend::set_device_state_fd`].
+    #[cfg(unix)]
     fn check_device_state(&self) -> Result<()>;
 
     /// Sends VHOST_USER_POSTCOPY_ADVISE msg to the backend
@@ -151,6 +197,7 @@ impl Frontend {
     }
 
     /// Create a new instance from a Unix stream socket.
+    #[cfg(unix)]
     pub fn from_stream(sock: UnixStream, max_queue_num: u64) -> Self {
         Self::new(
             Endpoint::<VhostUserMsgHeader<FrontendReq>>::from_stream(sock),
@@ -158,15 +205,22 @@ impl Frontend {
         )
     }
 
-    /// Create a new vhost-user frontend endpoint.
+    /// Create a new instance from a Unix stream socket and a handle to the backend process.
     ///
-    /// Will retry as the backend may not be ready to accept the connection.
-    ///
-    /// # Arguments
-    /// * `path` - path of Unix domain socket listener to connect to
-    pub fn connect<P: AsRef<Path>>(path: P, max_queue_num: u64) -> Result<Self> {
+    /// See [`Frontend::connect`] for what `backend_process` must be.
+    #[cfg(windows)]
+    pub fn from_stream(sock: UnixStream, max_queue_num: u64, backend_process: OwnedHandle) -> Self {
+        let mut endpoint = Endpoint::<VhostUserMsgHeader<FrontendReq>>::from_stream(sock);
+        endpoint.set_peer_process(backend_process);
+        Self::new(endpoint, max_queue_num)
+    }
+
+    /// Connect to the backend's socket, retrying while the backend may not be listening yet.
+    fn connect_endpoint<P: AsRef<Path>>(
+        path: P,
+    ) -> VhostUserResult<Endpoint<VhostUserMsgHeader<FrontendReq>>> {
         let mut retry_count = 5;
-        let endpoint = loop {
+        loop {
             match Endpoint::<VhostUserMsgHeader<FrontendReq>>::connect(&path) {
                 Ok(endpoint) => break Ok(endpoint),
                 Err(e) => match &e {
@@ -182,8 +236,41 @@ impl Frontend {
                     _ => break Err(e),
                 },
             }
-        }?;
+        }
+    }
 
+    /// Create a new vhost-user frontend endpoint.
+    ///
+    /// Will retry as the backend may not be ready to accept the connection.
+    ///
+    /// # Arguments
+    /// * `path` - path of Unix domain socket listener to connect to
+    #[cfg(unix)]
+    pub fn connect<P: AsRef<Path>>(path: P, max_queue_num: u64) -> Result<Self> {
+        Ok(Self::new(Self::connect_endpoint(path)?, max_queue_num))
+    }
+
+    /// Create a new vhost-user frontend endpoint.
+    ///
+    /// Will retry as the backend may not be ready to accept the connection.
+    ///
+    /// # Arguments
+    /// * `path` - path of Unix domain socket listener to connect to
+    /// * `backend_process` - handle to the backend process, `PROCESS_DUP_HANDLE` access, held for
+    ///   the connection's lifetime. Every object handed to the backend is duplicated through it.
+    ///   To keep the delivery guarantee `SCM_RIGHTS` gives POSIX, it must come from creating the
+    ///   backend process (`CreateProcess`) or from the component that did — never from looking up
+    ///   a process ID observed at run time, which can attach the transfer to an unrelated process
+    ///   once the ID is reused. Note the handle confers effectively complete control of the
+    ///   backend process.
+    #[cfg(windows)]
+    pub fn connect<P: AsRef<Path>>(
+        path: P,
+        max_queue_num: u64,
+        backend_process: OwnedHandle,
+    ) -> Result<Self> {
+        let mut endpoint = Self::connect_endpoint(path)?;
+        endpoint.set_peer_process(backend_process);
         Ok(Self::new(endpoint, max_queue_num))
     }
 
@@ -237,7 +324,7 @@ impl VhostBackend for Frontend {
 
         let mut ctx = VhostUserMemoryContext::new();
         for region in regions.iter() {
-            if region.memory_size == 0 || region.mmap_handle < 0 {
+            if region.memory_size == 0 || !valid_descriptor(region.mmap_handle) {
                 return error_code(VhostUserError::InvalidParam);
             }
 
@@ -284,7 +371,7 @@ impl VhostBackend for Frontend {
         }
     }
 
-    fn set_log_fd(&self, fd: RawFd) -> Result<()> {
+    fn set_log_fd(&self, fd: RawDescriptor) -> Result<()> {
         let mut node = self.node();
         let fds = [fd];
         let hdr = node.send_request_header(FrontendReq::SET_LOG_FD, Some(&fds))?;
@@ -351,7 +438,7 @@ impl VhostBackend for Frontend {
             return error_code(VhostUserError::InvalidParam);
         }
         let hdr =
-            node.send_fd_for_vring(FrontendReq::SET_VRING_CALL, queue_index, fd.as_raw_fd())?;
+            node.send_fd_for_vring(FrontendReq::SET_VRING_CALL, queue_index, raw_descriptor(fd))?;
         node.wait_for_ack(&hdr).map_err(|e| e.into())
     }
 
@@ -365,7 +452,7 @@ impl VhostBackend for Frontend {
             return error_code(VhostUserError::InvalidParam);
         }
         let hdr =
-            node.send_fd_for_vring(FrontendReq::SET_VRING_KICK, queue_index, fd.as_raw_fd())?;
+            node.send_fd_for_vring(FrontendReq::SET_VRING_KICK, queue_index, raw_descriptor(fd))?;
         node.wait_for_ack(&hdr).map_err(|e| e.into())
     }
 
@@ -378,7 +465,7 @@ impl VhostBackend for Frontend {
             return error_code(VhostUserError::InvalidParam);
         }
         let hdr =
-            node.send_fd_for_vring(FrontendReq::SET_VRING_ERR, queue_index, fd.as_raw_fd())?;
+            node.send_fd_for_vring(FrontendReq::SET_VRING_ERR, queue_index, raw_descriptor(fd))?;
         node.wait_for_ack(&hdr).map_err(|e| e.into())
     }
 }
@@ -498,6 +585,7 @@ impl VhostUserFrontend for Frontend {
         node.wait_for_ack(&hdr).map_err(|e| e.into())
     }
 
+    #[cfg(unix)]
     fn set_backend_request_fd(&mut self, fd: &dyn AsRawFd) -> Result<()> {
         let mut node = self.node();
         node.check_proto_feature(VhostUserProtocolFeatures::BACKEND_REQ)?;
@@ -506,6 +594,7 @@ impl VhostUserFrontend for Frontend {
         node.wait_for_ack(&hdr).map_err(|e| e.into())
     }
 
+    #[cfg(unix)]
     fn get_shared_object(&mut self, uuid: &VhostUserSharedMsg) -> Result<File> {
         let mut node = self.node();
         node.check_proto_feature(VhostUserProtocolFeatures::SHARED_OBJECT)?;
@@ -537,11 +626,14 @@ impl VhostUserFrontend for Frontend {
         }
     }
 
-    fn set_inflight_fd(&mut self, inflight: &VhostUserInflight, fd: RawFd) -> Result<()> {
+    fn set_inflight_fd(&mut self, inflight: &VhostUserInflight, fd: RawDescriptor) -> Result<()> {
         let mut node = self.node();
         node.check_proto_feature(VhostUserProtocolFeatures::INFLIGHT_SHMFD)?;
 
-        if inflight.mmap_size == 0 || inflight.num_queues == 0 || inflight.queue_size == 0 || fd < 0
+        if inflight.mmap_size == 0
+            || inflight.num_queues == 0
+            || inflight.queue_size == 0
+            || !valid_descriptor(fd)
         {
             return error_code(VhostUserError::InvalidParam);
         }
@@ -564,7 +656,7 @@ impl VhostUserFrontend for Frontend {
     fn add_mem_region(&mut self, region: &VhostUserMemoryRegionInfo) -> Result<()> {
         let mut node = self.node();
         node.check_proto_feature(VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS)?;
-        if region.memory_size == 0 || region.mmap_handle < 0 {
+        if region.memory_size == 0 || !valid_descriptor(region.mmap_handle) {
             return error_code(VhostUserError::InvalidParam);
         }
 
@@ -596,6 +688,7 @@ impl VhostUserFrontend for Frontend {
         Ok(config)
     }
 
+    #[cfg(unix)]
     fn set_device_state_fd(
         &self,
         direction: VhostTransferStateDirection,
@@ -630,6 +723,7 @@ impl VhostUserFrontend for Frontend {
         error_code(VhostUserError::BackendInternalError)
     }
 
+    #[cfg(unix)]
     fn check_device_state(&self) -> Result<()> {
         let mut node = self.node();
         node.check_proto_feature(VhostUserProtocolFeatures::DEVICE_STATE)?;
@@ -674,6 +768,7 @@ impl VhostUserFrontend for Frontend {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for Frontend {
     fn as_raw_fd(&self) -> RawFd {
         let node = self.node();
@@ -681,10 +776,18 @@ impl AsRawFd for Frontend {
     }
 }
 
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for Frontend {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        let node = self.node();
+        node.main_sock.as_raw_socket()
+    }
+}
+
 /// Context object to pass guest memory configuration to VhostUserFrontend::set_mem_table().
 struct VhostUserMemoryContext {
     regions: VhostUserMemoryPayload,
-    fds: Vec<RawFd>,
+    fds: Vec<RawDescriptor>,
 }
 
 impl VhostUserMemoryContext {
@@ -696,8 +799,8 @@ impl VhostUserMemoryContext {
         }
     }
 
-    /// Append a user memory region and corresponding RawFd into the context object.
-    pub fn append(&mut self, region: &VhostUserMemoryRegion, fd: RawFd) {
+    /// Append a user memory region and its descriptor into the context object.
+    pub fn append(&mut self, region: &VhostUserMemoryRegion, fd: RawDescriptor) {
         self.regions.push(*region);
         self.fds.push(fd);
     }
@@ -728,7 +831,7 @@ impl FrontendInternal {
     fn send_request_header(
         &mut self,
         code: FrontendReq,
-        fds: Option<&[RawFd]>,
+        fds: Option<&[RawDescriptor]>,
     ) -> VhostUserResult<VhostUserMsgHeader<FrontendReq>> {
         self.check_state()?;
         let hdr = self.new_request_header(code, 0);
@@ -740,7 +843,7 @@ impl FrontendInternal {
         &mut self,
         code: FrontendReq,
         msg: &T,
-        fds: Option<&[RawFd]>,
+        fds: Option<&[RawDescriptor]>,
     ) -> VhostUserResult<VhostUserMsgHeader<FrontendReq>> {
         if mem::size_of::<T>() > MAX_MSG_SIZE {
             return Err(VhostUserError::InvalidParam);
@@ -757,7 +860,7 @@ impl FrontendInternal {
         code: FrontendReq,
         msg: &T,
         payload: &[u8],
-        fds: Option<&[RawFd]>,
+        fds: Option<&[RawDescriptor]>,
     ) -> VhostUserResult<VhostUserMsgHeader<FrontendReq>> {
         let len = mem::size_of::<T>() + payload.len();
         if len > MAX_MSG_SIZE {
@@ -780,7 +883,7 @@ impl FrontendInternal {
         &mut self,
         code: FrontendReq,
         queue_index: usize,
-        fd: RawFd,
+        fd: RawDescriptor,
     ) -> VhostUserResult<VhostUserMsgHeader<FrontendReq>> {
         if queue_index as u64 >= self.max_queue_num {
             return Err(VhostUserError::InvalidParam);
@@ -931,10 +1034,19 @@ mod tests {
     const INVALID_PROTOCOL_FEATURE: u64 = 1 << 63;
 
     fn temp_path() -> PathBuf {
-        PathBuf::from(format!(
-            "/tmp/vhost_test_{}",
+        std::env::temp_dir().join(format!(
+            "vhost_test_{}",
             rand_alphanumerics(8).to_str().unwrap()
         ))
+    }
+
+    /// `Frontend::connect` with the platform-specific arguments filled in; on Windows the test
+    /// plays both ends in one process, so the "backend process" is this one.
+    fn connect_frontend<P: AsRef<Path>>(path: P, max_queue_num: u64) -> Result<Frontend> {
+        #[cfg(unix)]
+        return Frontend::connect(path, max_queue_num);
+        #[cfg(windows)]
+        return Frontend::connect(path, max_queue_num, super::super::win32::current_process());
     }
 
     fn create_pair<P: AsRef<Path>>(
@@ -942,7 +1054,7 @@ mod tests {
     ) -> (Frontend, Endpoint<VhostUserMsgHeader<FrontendReq>>) {
         let listener = Listener::new(&path, true).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let frontend = Frontend::connect(path, 2).unwrap();
+        let frontend = connect_frontend(path, 2).unwrap();
         let backend = listener.accept().unwrap().unwrap();
         (frontend, Endpoint::from_stream(backend))
     }
@@ -953,11 +1065,12 @@ mod tests {
         let listener = Listener::new(&path, true).unwrap();
         listener.set_nonblocking(true).unwrap();
 
-        let frontend = Frontend::connect(&path, 1).unwrap();
+        let frontend = connect_frontend(&path, 1).unwrap();
         let mut backend = Endpoint::<VhostUserMsgHeader<FrontendReq>>::from_stream(
             listener.accept().unwrap().unwrap(),
         );
 
+        #[cfg(unix)]
         assert!(frontend.as_raw_fd() > 0);
         // Send two messages continuously
         frontend.set_owner().unwrap();
@@ -981,13 +1094,13 @@ mod tests {
         let path = temp_path();
         let _ = Listener::new(&path, true).unwrap();
         let _ = Listener::new(&path, false).is_err();
-        assert!(Frontend::connect(&path, 1).is_err());
+        assert!(connect_frontend(&path, 1).is_err());
 
         let listener = Listener::new(&path, true).unwrap();
         assert!(Listener::new(&path, false).is_err());
         listener.set_nonblocking(true).unwrap();
 
-        let _frontend = Frontend::connect(&path, 1).unwrap();
+        let _frontend = connect_frontend(&path, 1).unwrap();
         let _backend = listener.accept().unwrap().unwrap();
     }
 
@@ -1331,6 +1444,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_frontend_set_device_state_fd_no_return_fd() {
         let (frontend, mut peer) = create_pair2();
@@ -1356,6 +1470,7 @@ mod tests {
         assert!(res.is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_frontend_set_device_state_fd_with_return_fd() {
         let (frontend, mut peer) = create_pair2();
@@ -1384,6 +1499,7 @@ mod tests {
         assert!(returned.as_raw_fd() > 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_frontend_check_device_state() {
         let (frontend, mut peer) = create_pair2();

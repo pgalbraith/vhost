@@ -315,6 +315,13 @@ impl<R: Req> MsgHeader for VhostUserMsgHeader<R> {
 
     #[cfg(windows)]
     fn win32_handle_trailer(&self, payload: &[u8]) -> Result<usize> {
+        // No reply carries a trailer on Windows: every feature whose reply attaches a descriptor
+        // on POSIX is left un-negotiated there. The check matters because a REPLY_ACK ack echoes
+        // the request code — without it, the ack for e.g. SET_VRING_KICK would be counted as
+        // carrying the record only the request has.
+        if self.is_reply() {
+            return Ok(0);
+        }
         R::win32_handle_trailer(self.get_code()?, payload)
     }
 

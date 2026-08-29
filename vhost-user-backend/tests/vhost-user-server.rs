@@ -1,7 +1,8 @@
 // Exercises a Rust vhost-user *frontend* (`vhost::vhost_user::Frontend`) against this crate's
-// backend. No Rust frontend on Windows — QEMU is the only frontend there, reached over the
-// named-object transport, not this API — so `Frontend`/`VhostUserFrontend` are unix-only, and so
-// is this test.
+// backend. Unix only, though the frontend itself now exists on Windows too: this flow leans on
+// POSIX-only pieces — memfd-backed guest memory, the backend-request channel, shared objects —
+// and this crate has not yet chosen the protocol features a Windows backend advertises. The
+// Windows frontend↔backend integration test lives in `vhost` (`vhost_user::windows_tests`).
 #![cfg(unix)]
 
 use std::fs::File;

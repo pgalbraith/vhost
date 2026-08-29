@@ -13,7 +13,9 @@
 //! VHOST_USER_SET_BACKEND_REQ_FD request to the backend with an auxiliary file descriptor.
 //!
 //! Unix domain socket is used as the underlying communication channel because the frontend needs to
-//! send file descriptors to the backend.
+//! send file descriptors to the backend. On Windows the same `AF_UNIX` byte stream carries the
+//! messages, and kernel object handles duplicated between the processes stand in for file
+//! descriptors — see the `win32` module for the scheme.
 //!
 //! Most messages that can be sent via the Unix domain socket implementing vhost-user have an
 //! equivalent ioctl to the kernel implementation.
@@ -29,13 +31,12 @@ pub use self::connection::Listener;
 #[cfg(windows)]
 mod win32;
 
-// The frontend hands out the objects backing guest memory and vring notifications. On Windows
-// that's QEMU duplicating kernel object handles into us, not this crate, so there's no frontend
-// here.
-#[cfg(all(unix, feature = "vhost-user-frontend"))]
+#[cfg(feature = "vhost-user-frontend")]
 mod frontend;
-#[cfg(all(unix, feature = "vhost-user-frontend"))]
+#[cfg(feature = "vhost-user-frontend")]
 pub use self::frontend::{Frontend, VhostUserFrontend};
+// The frontend half of the backend-req channel, which is set up by handing a socket over the
+// connection — like the channel itself (see `backend_req` below), never negotiated on Windows.
 #[cfg(all(unix, feature = "vhost-user"))]
 mod frontend_req_handler;
 #[cfg(all(unix, feature = "vhost-user"))]
@@ -115,9 +116,12 @@ pub enum Error {
     FileTruncateError,
     /// memfd file seal errors
     MemFdSealError,
-    /// A message carried a handle record that is not a live handle in this process.
+    /// A message carried a handle record that does not name a live handle.
     #[cfg(windows)]
     Win32InvalidHandle(std::io::Error),
+    /// Duplicating an object's handle into the backend process failed.
+    #[cfg(windows)]
+    Win32HandleTransfer(std::io::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -159,6 +163,10 @@ impl std::fmt::Display for Error {
             Error::Win32InvalidHandle(e) => {
                 write!(f, "message carried an invalid Win32 handle: {e}")
             }
+            #[cfg(windows)]
+            Error::Win32HandleTransfer(e) => {
+                write!(f, "duplicating a Win32 handle into the backend failed: {e}")
+            }
         }
     }
 }
@@ -194,6 +202,10 @@ impl Error {
             // The peer sent a handle value we cannot use; reconnecting would not change that.
             #[cfg(windows)]
             Error::Win32InvalidHandle(_) => false,
+            // Either our own handle or the backend process handle is bad; reconnecting over the
+            // same process handle would fail the same way.
+            #[cfg(windows)]
+            Error::Win32HandleTransfer(_) => false,
         }
     }
 }
@@ -293,8 +305,9 @@ macro_rules! enum_value {
 
 use enum_value;
 
-// Only used by the tests below and in `backend_req_handler`, both of which are POSIX only.
-#[cfg(all(unix, test, feature = "vhost-user-backend"))]
+// Only used by tests: the POSIX and Windows integration tests below, and
+// `backend_req_handler`'s own (POSIX only).
+#[cfg(all(test, feature = "vhost-user-backend"))]
 mod dummy_backend;
 
 #[cfg(all(
@@ -629,5 +642,162 @@ mod tests {
         } else {
             panic!("invalid error code conversion!");
         }
+    }
+}
+
+// The Windows counterpart of the integration tests above: a Rust frontend driving a Rust backend
+// over one socket, both ends in one process, with the objects crossing as duplicated handles.
+// Scoped to what the Windows binding's first version negotiates — no inflight tracking, dirty
+// logging, backend channel, shared objects or device state.
+#[cfg(all(
+    windows,
+    test,
+    feature = "vhost-user-frontend",
+    feature = "vhost-user-backend"
+))]
+mod windows_tests {
+    use std::os::windows::io::AsRawHandle;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
+
+    use vmm_sys_util::eventfd::EventFd;
+    use vmm_sys_util::rand::rand_alphanumerics;
+    use vmm_sys_util::section::Section;
+    use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    use super::dummy_backend::{DummyBackendReqHandler, VIRTIO_FEATURES};
+    use super::message::*;
+    use super::*;
+    use crate::backend::VhostBackend;
+    use crate::{VhostUserMemoryRegionInfo, VringConfigData};
+
+    fn temp_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "vhost_test_{}",
+            rand_alphanumerics(8).to_str().unwrap()
+        ))
+    }
+
+    fn create_backend<P, S>(path: P, backend: Arc<S>) -> (Frontend, BackendReqHandler<S>)
+    where
+        P: AsRef<Path>,
+        S: VhostUserBackendReqHandler,
+    {
+        let mut listener = Listener::new(&path, true).unwrap();
+        let mut backend_listener = BackendListener::new(&mut listener, backend).unwrap();
+        // Both ends are this process, so this process plays the backend for handle transfer.
+        let frontend = Frontend::connect(&path, 1, win32::current_process()).unwrap();
+        (frontend, backend_listener.accept().unwrap().unwrap())
+    }
+
+    /// The v1 startup flow end to end: ownership, feature negotiation, guest memory as section
+    /// handles, vring setup with event objects, config space, and incremental memory regions.
+    #[test]
+    fn test_frontend_backend_process() {
+        let mbar = Arc::new(Barrier::new(2));
+        let sbar = mbar.clone();
+        let backend_be = Arc::new(Mutex::new(DummyBackendReqHandler::new()));
+        let (mut frontend, mut backend) = create_backend(temp_path(), backend_be.clone());
+
+        thread::spawn(move || {
+            // One handle_request() per message the frontend sends below.
+            for _ in 0..20 {
+                backend.handle_request().unwrap();
+            }
+            sbar.wait();
+        });
+
+        frontend.set_owner().unwrap();
+
+        let features = frontend.get_features().unwrap();
+        assert_eq!(features, VIRTIO_FEATURES);
+        frontend.set_features(VIRTIO_FEATURES & !0x1).unwrap();
+
+        // Ack the protocol features this flow uses; all of them are Windows-expressible.
+        let features = frontend.get_protocol_features().unwrap();
+        let acked = VhostUserProtocolFeatures::MQ
+            | VhostUserProtocolFeatures::CONFIG
+            | VhostUserProtocolFeatures::REPLY_ACK
+            | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS;
+        assert!(features.contains(acked));
+        frontend.set_protocol_features(acked).unwrap();
+
+        let num = frontend.get_queue_num().unwrap();
+        assert_eq!(num, 2);
+
+        // Two regions of one section — the shape a single shared guest RAM block has on the
+        // wire, one duplicated handle per region.
+        let section = Section::new(0x10_0000).unwrap();
+        let mem = [
+            VhostUserMemoryRegionInfo::new(0, 0x8_0000, 0, 0, section.as_raw_handle()),
+            VhostUserMemoryRegionInfo::new(
+                0x8_0000,
+                0x8_0000,
+                0,
+                0x8_0000,
+                section.as_raw_handle(),
+            ),
+        ];
+        frontend.set_mem_table(&mem).unwrap();
+
+        frontend
+            .set_config(0x100, VhostUserConfigFlags::WRITABLE, &[0xa5u8; 4])
+            .unwrap();
+        let buf = [0u8; 4];
+        let (reply_body, reply_payload) = frontend
+            .get_config(0x100, 4, VhostUserConfigFlags::empty(), &buf)
+            .unwrap();
+        assert_eq!({ reply_body.offset }, 0x100);
+        assert_eq!(&reply_payload, &[0xa5; 4]);
+
+        frontend.set_vring_enable(0, true).unwrap();
+        frontend.set_vring_num(0, 256).unwrap();
+        frontend.set_vring_base(0, 0).unwrap();
+        let config = VringConfigData {
+            queue_max_size: 256,
+            queue_size: 128,
+            flags: 0,
+            desc_table_addr: 0x1000,
+            used_ring_addr: 0x2000,
+            avail_ring_addr: 0x3000,
+            log_addr: None,
+        };
+        frontend.set_vring_addr(0, &config).unwrap();
+
+        let call = EventFd::new(0).unwrap();
+        let kick = EventFd::new(0).unwrap();
+        let err = EventFd::new(0).unwrap();
+        frontend.set_vring_call(0, &call).unwrap();
+        frontend.set_vring_kick(0, &kick).unwrap();
+        frontend.set_vring_err(0, &err).unwrap();
+
+        let max_mem_slots = frontend.get_max_mem_slots().unwrap();
+        assert_eq!(max_mem_slots, 509);
+
+        let extra = Section::new(0x10_0000).unwrap();
+        let region =
+            VhostUserMemoryRegionInfo::new(0x10_0000, 0x10_0000, 0, 0, extra.as_raw_handle());
+        frontend.add_mem_region(&region).unwrap();
+        frontend.remove_mem_region(&region).unwrap();
+
+        // With REPLY_ACK negotiated and NEED_REPLY set, the ack for this echoes the
+        // SET_VRING_KICK code — the one reply shape that would be misparsed if replies were
+        // counted for handle trailers.
+        frontend.set_hdr_flags(VhostUserHeaderFlag::NEED_REPLY);
+        let kick2 = EventFd::new(0).unwrap();
+        frontend.set_vring_kick(0, &kick2).unwrap();
+
+        mbar.wait();
+
+        // The backend's kick descriptor is a live duplicate of `kick2`: signaling the
+        // frontend's end is observable through the backend's.
+        let handler = backend_be.lock().unwrap();
+        let received = handler.kick_fd[0].as_ref().unwrap();
+        kick2.write(1).unwrap();
+        // SAFETY: the received `File` keeps its handle open for the duration of the wait.
+        let woken = unsafe { WaitForSingleObject(received.as_raw_handle() as HANDLE, 0) };
+        assert_eq!(woken, WAIT_OBJECT_0);
     }
 }

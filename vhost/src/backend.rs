@@ -9,28 +9,29 @@
 
 //! Common traits and structs for vhost-kern and vhost-user backend drivers.
 
-// Below: APIs that carry raw fds — vhost-kern drivers and the vhost-user frontend, neither
-// supported on Windows. Descriptor-free items (vring config, IOTLB) stay portable. See the
-// `vhost_user` module docs for how the Windows backend replaces descriptor passing.
-#[cfg(unix)]
 use std::cell::RefCell;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::io::RawFd;
-#[cfg(unix)]
 use std::sync::RwLock;
 
 #[cfg(unix)]
 use vm_memory::{bitmap::Bitmap, Address, GuestMemoryRegion, GuestRegionMmap};
-#[cfg(unix)]
 use vmm_sys_util::eventfd::EventFd;
 
-#[cfg(all(unix, feature = "vhost-user"))]
+#[cfg(feature = "vhost-user")]
 use super::vhost_user::message::{VhostUserMemoryRegion, VhostUserSingleMemoryRegion};
 #[cfg(unix)]
 use super::Error;
 use super::Result;
+
+/// A raw handle to an OS object that vhost passes between processes: a file descriptor on POSIX
+/// hosts, a kernel object `HANDLE` on Windows hosts.
+#[cfg(unix)]
+pub type RawDescriptor = std::os::unix::io::RawFd;
+/// A raw handle to an OS object that vhost passes between processes: a file descriptor on POSIX
+/// hosts, a kernel object `HANDLE` on Windows hosts.
+#[cfg(windows)]
+pub type RawDescriptor = std::os::windows::io::RawHandle;
 
 /// Maximum number of memory regions supported.
 pub const VHOST_MAX_MEMORY_REGIONS: usize = 255;
@@ -75,8 +76,8 @@ impl VringConfigData {
 }
 
 /// Memory region configuration data.
-#[cfg(unix)]
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
+#[cfg_attr(unix, derive(Default))]
 pub struct VhostUserMemoryRegionInfo {
     /// Guest physical address of the memory region.
     pub guest_phys_addr: u64,
@@ -86,8 +87,9 @@ pub struct VhostUserMemoryRegionInfo {
     pub userspace_addr: u64,
     /// Optional offset where region starts in the mapped memory.
     pub mmap_offset: u64,
-    /// Optional file descriptor for mmap.
-    pub mmap_handle: RawFd,
+    /// Descriptor of the object backing the region: a mappable file descriptor on POSIX hosts, a
+    /// file-mapping object handle on Windows hosts.
+    pub mmap_handle: RawDescriptor,
 
     #[cfg(feature = "xen")]
     /// Xen specific flags.
@@ -98,9 +100,34 @@ pub struct VhostUserMemoryRegionInfo {
     pub xen_mmap_data: u32,
 }
 
-#[cfg(unix)]
+// `Default` can't be derived on Windows, where `RawDescriptor` is a raw pointer; a null handle is
+// the moral equivalent of the derive's fd 0.
+#[cfg(windows)]
+impl Default for VhostUserMemoryRegionInfo {
+    fn default() -> Self {
+        Self {
+            guest_phys_addr: 0,
+            memory_size: 0,
+            userspace_addr: 0,
+            mmap_offset: 0,
+            mmap_handle: std::ptr::null_mut(),
+            #[cfg(feature = "xen")]
+            xen_mmap_flags: 0,
+            #[cfg(feature = "xen")]
+            xen_mmap_data: 0,
+        }
+    }
+}
+
 impl VhostUserMemoryRegionInfo {
     /// Creates Self from GuestRegionMmap.
+    ///
+    /// POSIX only: `mmap_handle` must be something the peer can map, and the file descriptor a
+    /// file-backed region holds is exactly that. On Windows the wire carries file-mapping object
+    /// handles, and a `GuestRegionMmap` doesn't keep one — a region mapped from a section doesn't
+    /// record it, and a file-backed region closes the mapping object it creates once the view
+    /// exists. A Windows frontend builds this struct from the section handles it owns.
+    #[cfg(unix)]
     pub fn from_guest_region<B: Bitmap>(region: &GuestRegionMmap<B>) -> Result<Self> {
         let file_offset = region
             .file_offset()
@@ -120,7 +147,7 @@ impl VhostUserMemoryRegionInfo {
     }
 
     /// Creates VhostUserMemoryRegion from Self.
-    #[cfg(all(unix, feature = "vhost-user"))]
+    #[cfg(feature = "vhost-user")]
     pub fn to_region(&self) -> VhostUserMemoryRegion {
         #[cfg(not(feature = "xen"))]
         return VhostUserMemoryRegion::new(
@@ -142,7 +169,7 @@ impl VhostUserMemoryRegionInfo {
     }
 
     /// Creates VhostUserSingleMemoryRegion from Self.
-    #[cfg(all(unix, feature = "vhost-user"))]
+    #[cfg(feature = "vhost-user")]
     pub fn to_single_region(&self) -> VhostUserSingleMemoryRegion {
         VhostUserSingleMemoryRegion::new(
             self.guest_phys_addr,
@@ -158,15 +185,28 @@ impl VhostUserMemoryRegionInfo {
 }
 
 /// Shared memory region data for logging dirty pages
-#[cfg(unix)]
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
+#[cfg_attr(unix, derive(Default))]
 pub struct VhostUserDirtyLogRegion {
     /// Size of the shared memory region for logging dirty pages
     pub mmap_size: u64,
     /// Offset where region starts
     pub mmap_offset: u64,
-    /// File descriptor for mmap
-    pub mmap_handle: RawFd,
+    /// Descriptor of the object backing the log: a mappable file descriptor on POSIX hosts, a
+    /// file-mapping object handle on Windows hosts.
+    pub mmap_handle: RawDescriptor,
+}
+
+// Same story as `VhostUserMemoryRegionInfo`: `Default` can't be derived over a raw pointer.
+#[cfg(windows)]
+impl Default for VhostUserDirtyLogRegion {
+    fn default() -> Self {
+        Self {
+            mmap_size: 0,
+            mmap_offset: 0,
+            mmap_handle: std::ptr::null_mut(),
+        }
+    }
 }
 
 /// Vhost memory access permission (VHOST_ACCESS_* mapping)
@@ -249,7 +289,6 @@ pub trait VhostIotlbBackend: std::marker::Sized {
 /// VMM process. Typically fast paths for IO operations are delegated to the dedicated IO service
 /// processes, and slow path for device configuration are still handled by the VMM process. It may
 /// also be used to control access permissions of virtio backend devices.
-#[cfg(unix)]
 pub trait VhostBackend: std::marker::Sized {
     /// Get a bitmask of supported virtio/vhost features.
     fn get_features(&self) -> Result<u64>;
@@ -276,7 +315,7 @@ pub trait VhostBackend: std::marker::Sized {
     fn set_log_base(&self, base: u64, region: Option<VhostUserDirtyLogRegion>) -> Result<()>;
 
     /// Specify an eventfd file descriptor to signal on log write.
-    fn set_log_fd(&self, fd: RawFd) -> Result<()>;
+    fn set_log_fd(&self, fd: RawDescriptor) -> Result<()>;
 
     /// Set the number of descriptors in the vring.
     ///
@@ -336,7 +375,6 @@ pub trait VhostBackend: std::marker::Sized {
 /// VMM process. Typically fast paths for IO operations are delegated to the dedicated IO service
 /// processes, and slow path for device configuration are still handled by the VMM process. It may
 /// also be used to control access permissions of virtio backend devices.
-#[cfg(unix)]
 pub trait VhostBackendMut: std::marker::Sized {
     /// Get a bitmask of supported virtio/vhost features.
     fn get_features(&mut self) -> Result<u64>;
@@ -363,7 +401,7 @@ pub trait VhostBackendMut: std::marker::Sized {
     fn set_log_base(&mut self, base: u64, region: Option<VhostUserDirtyLogRegion>) -> Result<()>;
 
     /// Specify an eventfd file descriptor to signal on log write.
-    fn set_log_fd(&mut self, fd: RawFd) -> Result<()>;
+    fn set_log_fd(&mut self, fd: RawDescriptor) -> Result<()>;
 
     /// Set the number of descriptors in the vring.
     ///
@@ -412,7 +450,6 @@ pub trait VhostBackendMut: std::marker::Sized {
     fn set_vring_err(&mut self, queue_index: usize, fd: &EventFd) -> Result<()>;
 }
 
-#[cfg(unix)]
 impl<T: VhostBackendMut> VhostBackend for RwLock<T> {
     fn get_features(&self) -> Result<u64> {
         self.write().unwrap().get_features()
@@ -438,7 +475,7 @@ impl<T: VhostBackendMut> VhostBackend for RwLock<T> {
         self.write().unwrap().set_log_base(base, region)
     }
 
-    fn set_log_fd(&self, fd: RawFd) -> Result<()> {
+    fn set_log_fd(&self, fd: RawDescriptor) -> Result<()> {
         self.write().unwrap().set_log_fd(fd)
     }
 
@@ -473,7 +510,6 @@ impl<T: VhostBackendMut> VhostBackend for RwLock<T> {
     }
 }
 
-#[cfg(unix)]
 impl<T: VhostBackendMut> VhostBackend for RefCell<T> {
     fn get_features(&self) -> Result<u64> {
         self.borrow_mut().get_features()
@@ -499,7 +535,7 @@ impl<T: VhostBackendMut> VhostBackend for RefCell<T> {
         self.borrow_mut().set_log_base(base, region)
     }
 
-    fn set_log_fd(&self, fd: RawFd) -> Result<()> {
+    fn set_log_fd(&self, fd: RawDescriptor) -> Result<()> {
         self.borrow_mut().set_log_fd(fd)
     }
 
@@ -532,7 +568,7 @@ impl<T: VhostBackendMut> VhostBackend for RefCell<T> {
     }
 }
 
-#[cfg(all(unix, any(test, feature = "test-utils")))]
+#[cfg(any(test, feature = "test-utils"))]
 impl VhostUserMemoryRegionInfo {
     /// creates instance of `VhostUserMemoryRegionInfo`.
     pub fn new(
@@ -540,7 +576,7 @@ impl VhostUserMemoryRegionInfo {
         memory_size: u64,
         userspace_addr: u64,
         mmap_offset: u64,
-        mmap_handle: RawFd,
+        mmap_handle: RawDescriptor,
     ) -> Self {
         Self {
             guest_phys_addr,
@@ -557,9 +593,14 @@ impl VhostUserMemoryRegionInfo {
     }
 }
 
-#[cfg(all(unix, test))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in descriptor value for calls that never dereference it.
+    fn desc(v: usize) -> RawDescriptor {
+        v as RawDescriptor
+    }
 
     struct MockBackend {}
 
@@ -594,12 +635,12 @@ mod tests {
             let region = region.unwrap();
             assert_eq!(region.mmap_size, 0x1000);
             assert_eq!(region.mmap_offset, 0x10);
-            assert_eq!(region.mmap_handle, 100);
+            assert_eq!(region.mmap_handle, desc(100));
             Ok(())
         }
 
-        fn set_log_fd(&mut self, fd: RawFd) -> Result<()> {
-            assert_eq!(fd, 100);
+        fn set_log_fd(&mut self, fd: RawDescriptor) -> Result<()> {
+            assert_eq!(fd, desc(100));
             Ok(())
         }
 
@@ -659,11 +700,11 @@ mod tests {
             Some(VhostUserDirtyLogRegion {
                 mmap_size: 0x1000,
                 mmap_offset: 0x10,
-                mmap_handle: 100,
+                mmap_handle: desc(100),
             }),
         )
         .unwrap();
-        b.set_log_fd(100).unwrap();
+        b.set_log_fd(desc(100)).unwrap();
         b.set_vring_num(1, 256).unwrap();
 
         let config = VringConfigData {

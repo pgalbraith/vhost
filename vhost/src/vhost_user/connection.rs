@@ -6,8 +6,8 @@
 //! The vhost-user control channel is an `AF_UNIX` byte stream on every platform. What differs is
 //! how the objects the protocol hands over — guest memory, vring kick/call/err — travel across it:
 //! on POSIX they're descriptors attached via `SCM_RIGHTS`; Windows has no ancillary data, so there
-//! the frontend duplicates each object's handle into this process and the resulting handle values
-//! ride in the message payload. See [`win32`](super::win32) for that scheme.
+//! the sender duplicates each object's handle into the backend process and the resulting handle
+//! values ride in the message payload. See [`win32`](super::win32) for that scheme.
 //!
 //! The platform-specific halves of [`Endpoint`] live in [`unix`] and [`windows`]; the rest is
 //! shared.
@@ -33,14 +33,10 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-/// A raw handle the send side attaches to a message for an object the protocol passes between
-/// peers. Windows has no descriptor-passing counterpart, so [`Endpoint::send_iovec`] rejects a
-/// non-empty slice there; handle values ride in the payload instead.
-#[cfg(unix)]
-pub(super) type RawDescriptor = std::os::unix::io::RawFd;
-/// A raw handle on an object the protocol passes between peers.
-#[cfg(windows)]
-pub(super) type RawDescriptor = std::os::windows::io::RawHandle;
+// A raw handle the send side attaches to a message for an object the protocol passes between
+// peers. On Windows, sending one requires the endpoint to hold the peer's process handle — see
+// `Endpoint::set_peer_process`.
+pub(super) use crate::RawDescriptor;
 
 /// Unix domain socket listener for accepting incoming connections.
 pub struct Listener {
@@ -148,11 +144,17 @@ impl Drop for Listener {
 pub(super) struct Endpoint<H: MsgHeader> {
     sock: UnixStream,
     /// Payload of the message whose header was returned by the most recent `recv_header()`, with
-    /// the name trailer already split off. The Windows endpoint has to read a message's payload in
-    /// full before it can hand over the header, because the names of the objects the message passes
-    /// sit at the payload's end.
+    /// the handle trailer already split off. The Windows endpoint has to read a message's payload
+    /// in full before it can hand over the header, because the records for the objects the message
+    /// passes sit at the payload's end.
     #[cfg(windows)]
     pending: Vec<u8>,
+    /// Handle to the peer process, `PROCESS_DUP_HANDLE` access. Set only on the frontend side,
+    /// via `set_peer_process`: the frontend duplicates every object it sends into the process
+    /// this handle names, and pulls every object it receives out of it. `None` on the backend
+    /// side, where a received record is already a handle valid here and nothing is ever sent.
+    #[cfg(windows)]
+    peer_process: Option<std::os::windows::io::OwnedHandle>,
     _h: PhantomData<H>,
 }
 
@@ -173,6 +175,8 @@ impl<H: MsgHeader> Endpoint<H> {
             sock,
             #[cfg(windows)]
             pending: Vec::new(),
+            #[cfg(windows)]
+            peer_process: None,
             _h: PhantomData,
         }
     }
