@@ -279,6 +279,24 @@ impl Frontend {
         let mut node = self.node();
         node.hdr_flags = flags;
     }
+
+    /// Sets the base offset in the available vring, as the raw 32-bit wire value.
+    ///
+    /// [`VhostBackend::set_vring_base`] takes a `u16`, which covers a split ring's starting
+    /// index. A packed ring encodes more into the same wire field: bits 0-14 the last available
+    /// index, bit 15 the available wrap counter, bits 16-30 the last used index, bit 31 the used
+    /// wrap counter. This method sends the field uninterpreted, so a frontend can start a packed
+    /// ring; [`VhostBackend::get_vring_base`] already returns the full field.
+    pub fn set_vring_base_raw(&self, queue_index: usize, base: u32) -> Result<()> {
+        let mut node = self.node();
+        if queue_index as u64 >= node.max_queue_num {
+            return error_code(VhostUserError::InvalidParam);
+        }
+
+        let val = VhostUserVringState::new(queue_index as u32, base);
+        let hdr = node.send_request_with_body(FrontendReq::SET_VRING_BASE, &val, None)?;
+        node.wait_for_ack(&hdr).map_err(|e| e.into())
+    }
 }
 
 impl VhostBackend for Frontend {
@@ -1189,6 +1207,24 @@ mod tests {
         let msg = VhostUserU64::new(pfeatures.bits());
         peer.send_message(&hdr, &msg, None).unwrap();
         assert!(frontend.get_protocol_features().is_err());
+    }
+
+    #[test]
+    fn test_set_vring_base_raw() {
+        let path = temp_path();
+        let (frontend, mut peer) = create_pair(path);
+
+        // A packed ring's initial state: available and used wrap counters set (bits 15 and 31),
+        // both indices zero — a value the u16 of `set_vring_base` cannot carry.
+        frontend.set_vring_base_raw(1, 0x8000_8000).unwrap();
+        let (hdr, msg, rfds) = peer.recv_body::<VhostUserVringState>().unwrap();
+        assert_eq!(hdr.get_code().unwrap(), FrontendReq::SET_VRING_BASE);
+        assert!(rfds.is_none());
+        assert_eq!({ msg.index }, 1);
+        assert_eq!({ msg.num }, 0x8000_8000);
+
+        // Same queue-count bound as the u16 method.
+        assert!(frontend.set_vring_base_raw(2, 0).is_err());
     }
 
     #[test]
