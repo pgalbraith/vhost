@@ -180,6 +180,33 @@ where
         }
     }
 
+    /// Change which events an already-registered listener is watched for.
+    ///
+    /// Without this, a device that only sometimes wants writability -- while
+    /// it has data buffered to send, say -- has to unregister and register
+    /// again, and any event arriving in between is lost.
+    pub fn modify_listener(&self, fd: RawDescriptor, ev_type: EventSet, data: u64) -> Result<()> {
+        // `data` range [0...num_queues] is reserved for queues and exit event.
+        if data <= self.backend.num_queues() as u64 {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        } else {
+            self.modify_event(fd, ev_type, data)
+        }
+    }
+
+    pub(crate) fn modify_event(
+        &self,
+        fd: RawDescriptor,
+        ev_type: EventSet,
+        data: u64,
+    ) -> Result<()> {
+        self.epoll.ctl(
+            ControlOperation::Modify,
+            epoll_target(fd),
+            EpollEvent::new(ev_type, data),
+        )
+    }
+
     pub(crate) fn register_event(
         &self,
         fd: RawDescriptor,
