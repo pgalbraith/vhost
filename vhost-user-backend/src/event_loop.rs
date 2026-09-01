@@ -30,7 +30,22 @@ pub(crate) fn raw_descriptor(consumer: &EventConsumer) -> RawDescriptor {
     #[cfg(unix)]
     return consumer.as_raw_fd();
     #[cfg(windows)]
-    return consumer.as_raw_handle();
+    return consumer.as_raw_handle() as RawDescriptor;
+}
+
+/// A descriptor in the form `Epoll::ctl` takes on this platform.
+///
+/// `RawDescriptor` is an integer on both hosts so that it can live in the
+/// shared state a back-end keeps; `Epoll` names a handle on Windows. The
+/// conversion belongs here, at the one boundary that needs it, rather than
+/// in every caller.
+#[cfg(unix)]
+fn epoll_target(fd: RawDescriptor) -> RawDescriptor {
+    fd
+}
+#[cfg(windows)]
+fn epoll_target(fd: RawDescriptor) -> std::os::windows::io::RawHandle {
+    fd as std::os::windows::io::RawHandle
 }
 
 /// Errors related to vring epoll event handling.
@@ -172,7 +187,11 @@ where
         data: u64,
     ) -> Result<()> {
         self.epoll
-            .ctl(ControlOperation::Add, fd, EpollEvent::new(ev_type, data))
+            .ctl(
+                ControlOperation::Add,
+                epoll_target(fd),
+                EpollEvent::new(ev_type, data),
+            )
     }
 
     pub(crate) fn unregister_event(
@@ -182,7 +201,11 @@ where
         data: u64,
     ) -> Result<()> {
         self.epoll
-            .ctl(ControlOperation::Delete, fd, EpollEvent::new(ev_type, data))
+            .ctl(
+                ControlOperation::Delete,
+                epoll_target(fd),
+                EpollEvent::new(ev_type, data),
+            )
     }
 
     /// Run the event poll loop to handle all pending events on registered fds.

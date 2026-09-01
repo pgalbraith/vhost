@@ -30,8 +30,16 @@ use super::Result;
 pub type RawDescriptor = std::os::unix::io::RawFd;
 /// A raw handle to an OS object that vhost passes between processes: a file descriptor on POSIX
 /// hosts, a kernel object `HANDLE` on Windows hosts.
+///
+/// Deliberately an integer rather than `RawHandle`, which is `*mut c_void`
+/// and therefore not `Send`. A back-end keeps descriptors in state shared
+/// across threads -- a connection map, an interest list -- and
+/// `VhostUserBackend` requires `Send`, so a pointer-shaped descriptor makes
+/// those structures unusable for the very implementations this type exists
+/// to serve. It is an opaque token in this API either way; the conversion
+/// to a real `HANDLE` belongs at the few places that call Win32.
 #[cfg(windows)]
-pub type RawDescriptor = std::os::windows::io::RawHandle;
+pub type RawDescriptor = isize;
 
 /// Maximum number of memory regions supported.
 pub const VHOST_MAX_MEMORY_REGIONS: usize = 255;
@@ -77,7 +85,7 @@ impl VringConfigData {
 
 /// Memory region configuration data.
 #[derive(Clone, Copy)]
-#[cfg_attr(unix, derive(Default))]
+#[derive(Default)]
 pub struct VhostUserMemoryRegionInfo {
     /// Guest physical address of the memory region.
     pub guest_phys_addr: u64,
@@ -98,25 +106,6 @@ pub struct VhostUserMemoryRegionInfo {
     #[cfg(feature = "xen")]
     /// Xen specific data.
     pub xen_mmap_data: u32,
-}
-
-// `Default` can't be derived on Windows, where `RawDescriptor` is a raw pointer; a null handle is
-// the moral equivalent of the derive's fd 0.
-#[cfg(windows)]
-impl Default for VhostUserMemoryRegionInfo {
-    fn default() -> Self {
-        Self {
-            guest_phys_addr: 0,
-            memory_size: 0,
-            userspace_addr: 0,
-            mmap_offset: 0,
-            mmap_handle: std::ptr::null_mut(),
-            #[cfg(feature = "xen")]
-            xen_mmap_flags: 0,
-            #[cfg(feature = "xen")]
-            xen_mmap_data: 0,
-        }
-    }
 }
 
 impl VhostUserMemoryRegionInfo {
@@ -186,7 +175,7 @@ impl VhostUserMemoryRegionInfo {
 
 /// Shared memory region data for logging dirty pages
 #[derive(Clone, Copy)]
-#[cfg_attr(unix, derive(Default))]
+#[derive(Default)]
 pub struct VhostUserDirtyLogRegion {
     /// Size of the shared memory region for logging dirty pages
     pub mmap_size: u64,
@@ -195,18 +184,6 @@ pub struct VhostUserDirtyLogRegion {
     /// Descriptor of the object backing the log: a mappable file descriptor on POSIX hosts, a
     /// file-mapping object handle on Windows hosts.
     pub mmap_handle: RawDescriptor,
-}
-
-// Same story as `VhostUserMemoryRegionInfo`: `Default` can't be derived over a raw pointer.
-#[cfg(windows)]
-impl Default for VhostUserDirtyLogRegion {
-    fn default() -> Self {
-        Self {
-            mmap_size: 0,
-            mmap_offset: 0,
-            mmap_handle: std::ptr::null_mut(),
-        }
-    }
 }
 
 /// Vhost memory access permission (VHOST_ACCESS_* mapping)

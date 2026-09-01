@@ -501,7 +501,7 @@ mod tests {
         let hdr = VhostUserMsgHeader::new(FrontendReq::SET_VRING_KICK, 0, 0);
 
         assert!(matches!(
-            endpoint.send_header(&hdr, Some(&[std::ptr::null_mut()])),
+            endpoint.send_header(&hdr, Some(&[0])),
             Err(Error::InvalidOperation(_))
         ));
     }

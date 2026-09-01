@@ -40,7 +40,7 @@ fn raw_descriptor(fd: &EventFd) -> RawDescriptor {
     #[cfg(unix)]
     return fd.as_raw_fd();
     #[cfg(windows)]
-    return fd.as_raw_handle();
+    return fd.as_raw_handle() as RawDescriptor;
 }
 
 /// Whether a caller-supplied descriptor is something that could be handed over at all: fds are
@@ -51,8 +51,8 @@ fn valid_descriptor(desc: RawDescriptor) -> bool {
     #[cfg(unix)]
     return desc >= 0;
     #[cfg(windows)]
-    return !desc.is_null()
-        && !std::ptr::eq(desc, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+    return desc != 0
+        && desc != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE as RawDescriptor;
 }
 
 /// Trait for vhost-user frontend to provide extra methods not covered by the VhostBackend yet.
