@@ -25,6 +25,8 @@ use vm_memory::FileOffset;
 #[cfg(feature = "xen")]
 use vm_memory::{GuestAddress, MmapRange, MmapXenFlags};
 
+#[cfg(windows)]
+use super::win32::HandleTrailer;
 use super::{enum_value, Error, Result};
 use crate::VringConfigData;
 
@@ -69,16 +71,16 @@ pub const VHOST_USER_VRING_NOFD_MASK: u64 = 0x100;
 pub(super) trait Req:
     Clone + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Send + Sync + Into<u32> + TryFrom<u32>
 {
-    /// Number of Win32 handle records a request of this type carries as a trailer.
+    /// The Win32 handle records a request of this type carries as a trailer.
     ///
-    /// Windows counterpart of "how many descriptors does this request attach" — implied by the
-    /// request, not sent on the wire, same as the `SCM_RIGHTS` count on POSIX. `payload` includes
-    /// the trailer; the count is always derivable from its head.
+    /// Windows counterpart of "how many descriptors does this request attach, and what are they" —
+    /// implied by the request, not sent on the wire, same as the `SCM_RIGHTS` count on POSIX.
+    /// `payload` includes the trailer; the answer is always derivable from its head.
     ///
     /// See [`win32`](super::win32) for the wire format.
     #[cfg(windows)]
-    fn win32_handle_trailer(_code: Self, _payload: &[u8]) -> Result<usize> {
-        Ok(0)
+    fn win32_handle_trailer(_code: Self, _payload: &[u8]) -> Result<HandleTrailer> {
+        Ok(HandleTrailer::Empty)
     }
 }
 
@@ -88,11 +90,11 @@ pub(super) trait MsgHeader: ByteValued + Copy + Default + VhostUserMsgValidator 
     /// The maximum size of a msg that can be encapsulated by this MsgHeader
     const MAX_MSG_SIZE: usize;
 
-    /// Number of Win32 handle records this message carries as a trailer.
+    /// The Win32 handle records this message carries as a trailer.
     ///
     /// See [`Req::win32_handle_trailer`].
     #[cfg(windows)]
-    fn win32_handle_trailer(&self, payload: &[u8]) -> Result<usize>;
+    fn win32_handle_trailer(&self, payload: &[u8]) -> Result<HandleTrailer>;
 
     /// Get the payload size recorded in the header.
     #[cfg(windows)]
@@ -210,7 +212,7 @@ enum_value! {
 
 impl Req for FrontendReq {
     #[cfg(windows)]
-    fn win32_handle_trailer(code: Self, payload: &[u8]) -> Result<usize> {
+    fn win32_handle_trailer(code: Self, payload: &[u8]) -> Result<HandleTrailer> {
         let head_u32 = |payload: &[u8]| -> Result<u32> {
             let bytes = payload.get(..4).ok_or(Error::InvalidMessage)?;
             Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
@@ -224,19 +226,23 @@ impl Req for FrontendReq {
             // One section per region, in region order. Region count is at the payload head — same
             // as the POSIX descriptor count. Several regions sharing one section is normal: they
             // come from one memfd, and the frontend duplicates its handle once per region.
-            FrontendReq::SET_MEM_TABLE => Ok(head_u32(payload)? as usize),
-            FrontendReq::ADD_MEM_REG => Ok(1),
+            FrontendReq::SET_MEM_TABLE => Ok(HandleTrailer::Sections(head_u32(payload)? as usize)),
+            FrontendReq::ADD_MEM_REG => Ok(HandleTrailer::Sections(1)),
             // A vring notification carries one event object, unless the payload says otherwise.
             FrontendReq::SET_VRING_KICK
             | FrontendReq::SET_VRING_CALL
             | FrontendReq::SET_VRING_ERR => {
                 let nofd = head_u64(payload)? & VHOST_USER_VRING_NOFD_MASK != 0;
-                Ok(usize::from(!nofd))
+                Ok(if nofd {
+                    HandleTrailer::Empty
+                } else {
+                    HandleTrailer::Event
+                })
             }
             // Everything else that attaches a descriptor on POSIX (logging, inflight tracking,
             // backend-req channel, device state, shared objects) is a feature not negotiated on
             // Windows — no trailer.
-            _ => Ok(0),
+            _ => Ok(HandleTrailer::Empty),
         }
     }
 }
@@ -314,13 +320,13 @@ impl<R: Req> MsgHeader for VhostUserMsgHeader<R> {
     const MAX_MSG_SIZE: usize = MAX_MSG_SIZE;
 
     #[cfg(windows)]
-    fn win32_handle_trailer(&self, payload: &[u8]) -> Result<usize> {
+    fn win32_handle_trailer(&self, payload: &[u8]) -> Result<HandleTrailer> {
         // No reply carries a trailer on Windows: every feature whose reply attaches a descriptor
         // on POSIX is left un-negotiated there. The check matters because a REPLY_ACK ack echoes
         // the request code — without it, the ack for e.g. SET_VRING_KICK would be counted as
         // carrying the record only the request has.
         if self.is_reply() {
-            return Ok(0);
+            return Ok(HandleTrailer::Empty);
         }
         R::win32_handle_trailer(self.get_code()?, payload)
     }

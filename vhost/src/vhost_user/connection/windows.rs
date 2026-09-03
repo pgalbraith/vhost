@@ -129,7 +129,8 @@ impl<H: MsgHeader> Endpoint<H> {
     /// * - (message header, [received objects]) on success.
     /// * - Disconnected: the peer closed the connection.
     /// * - PartialMessage: received a partial message.
-    /// * - InvalidMessage: received an invalid message.
+    /// * - InvalidMessage: received an invalid message, including a handle record naming an
+    ///     object of a kind the request does not carry.
     /// * - OversizedMsg: the header claims a payload larger than the protocol allows.
     /// * - Win32InvalidHandle: a handle record was not a live handle here.
     /// * - SocketError: other socket related errors.
@@ -159,9 +160,9 @@ impl<H: MsgHeader> Endpoint<H> {
             return Err(Error::PartialMessage);
         }
 
-        let count = hdr.win32_handle_trailer(&payload)?;
+        let trailer = hdr.win32_handle_trailer(&payload)?;
         let peer = self.peer_process.as_ref().map(|p| p.as_handle());
-        let (base, files) = take_handles(peer, &payload, count)?;
+        let (base, files) = take_handles(peer, &payload, trailer)?;
 
         // Hide the trailer from callers, so that the message they see is the one a POSIX peer would
         // have sent.
