@@ -257,12 +257,35 @@ impl Frontend {
     /// # Arguments
     /// * `path` - path of Unix domain socket listener to connect to
     /// * `backend_process` - handle to the backend process, `PROCESS_DUP_HANDLE` access, held for
-    ///   the connection's lifetime. Every object handed to the backend is duplicated through it.
-    ///   To keep the delivery guarantee `SCM_RIGHTS` gives POSIX, it must come from creating the
-    ///   backend process (`CreateProcess`) or from the component that did — never from looking up
-    ///   a process ID observed at run time, which can attach the transfer to an unrelated process
-    ///   once the ID is reused. Note the handle confers effectively complete control of the
-    ///   backend process.
+    ///   the connection's lifetime. Every object handed to the backend is duplicated through it,
+    ///   so which process it names is what decides where guest memory ends up. Note the handle
+    ///   confers effectively complete control of the backend process.
+    ///
+    /// `SCM_RIGHTS` delivers to whoever is connected, and the permissions on the socket path are
+    /// the whole of what governs who that can be. `DuplicateHandle` names a process instead, so a
+    /// caller has to turn "whoever is connected" into "that process". Either of two ways is
+    /// sound:
+    ///
+    /// * *Resolve the peer of the connection*, reproducing the POSIX delivery. Take the peer's
+    ///   process ID (`SIO_AF_UNIX_GETPEERPID`), open it, and refuse the result unless its creation
+    ///   time (`GetProcessTimes`) is older than the connection: the peer was alive when the
+    ///   connection was established, so anything that later inherited its ID was created after
+    ///   that instant. Stamp the connection when it is seen established and not later — the gap
+    ///   between the two is a window in which the peer can exit and be replaced by a process the
+    ///   comparison still accepts — and note that creation times are system-clock values, so a
+    ///   backward step of that clock during the window defeats it too. This is what QEMU does by
+    ///   default on Windows.
+    /// * *Name the process in advance*, which is narrower than the POSIX delivery rather than
+    ///   equal to it: the objects reach that process or no process, whoever connects. The handle
+    ///   comes from `CreateProcess`, from the component that created the backend, or from opening
+    ///   the peer's process ID and requiring the process opened to present an identifier the
+    ///   system does not reuse — its process sequence number and creation time — that whoever
+    ///   started the backend recorded from it. The last form needs no clock and nothing
+    ///   inherited.
+    ///
+    /// What is never sound is opening a process ID observed at run time with neither check: IDs
+    /// are reused, and an unverified lookup can hand guest memory to an unrelated process, a
+    /// delivery POSIX can never make.
     #[cfg(windows)]
     pub fn connect<P: AsRef<Path>>(
         path: P,
