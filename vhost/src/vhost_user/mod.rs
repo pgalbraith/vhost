@@ -676,13 +676,13 @@ mod tests {
         // wire, one duplicated handle per region.
         let section = Section::new(0x10_0000).unwrap();
         let mem = [
-            VhostUserMemoryRegionInfo::new(0, 0x8_0000, 0, 0, section.as_raw_handle()),
+            VhostUserMemoryRegionInfo::new(0, 0x8_0000, 0, 0, section.as_raw_handle() as _),
             VhostUserMemoryRegionInfo::new(
                 0x8_0000,
                 0x8_0000,
                 0,
                 0x8_0000,
-                section.as_raw_handle(),
+                section.as_raw_handle() as _,
             ),
         ];
         frontend.set_mem_table(&mem).unwrap();
@@ -723,7 +723,7 @@ mod tests {
 
         let extra = Section::new(0x10_0000).unwrap();
         let region =
-            VhostUserMemoryRegionInfo::new(0x10_0000, 0x10_0000, 0, 0, extra.as_raw_handle());
+            VhostUserMemoryRegionInfo::new(0x10_0000, 0x10_0000, 0, 0, extra.as_raw_handle() as _);
         frontend.add_mem_region(&region).unwrap();
         frontend.remove_mem_region(&region).unwrap();
 
