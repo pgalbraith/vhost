@@ -36,8 +36,13 @@ use vm_memory::{
 };
 
 use super::backend::VhostUserBackend;
+#[cfg(all(windows, feature = "completion"))]
+use super::completion_backend::VhostUserCompletionBackend;
+#[cfg(all(windows, feature = "completion"))]
+use super::completion_loop::VringCompletionHandler;
 use super::event_loop::VringEpollError;
 use super::event_loop::VringEpollHandler;
+use super::protocol::ProtocolBackend;
 use super::vring::VringT;
 use super::worker::VringWorker;
 use super::GM;
@@ -54,6 +59,9 @@ pub enum VhostUserHandlerError {
     CreateVring(VirtQueError),
     /// Failed to create vring worker.
     CreateEpollHandler(VringEpollError),
+    /// Failed to create a completion-port vring worker, or the device refused to attach to it.
+    #[cfg(all(windows, feature = "completion"))]
+    CreateCompletionHandler(io::Error),
     /// Failed to spawn vring worker.
     SpawnVringWorker(io::Error),
     /// Could not find the mapping from memory regions.
@@ -68,6 +76,10 @@ impl std::fmt::Display for VhostUserHandlerError {
             }
             VhostUserHandlerError::CreateEpollHandler(e) => {
                 write!(f, "failed to create vring epoll handler: {e}")
+            }
+            #[cfg(all(windows, feature = "completion"))]
+            VhostUserHandlerError::CreateCompletionHandler(e) => {
+                write!(f, "failed to create vring completion handler: {e}")
             }
             VhostUserHandlerError::SpawnVringWorker(e) => {
                 write!(f, "failed spawning the vring worker: {e}")
@@ -93,8 +105,9 @@ struct AddrMapping {
 
 /// The control-channel side of a daemon: every vhost-user request lands here, and the vring
 /// workers (`W`, one per entry of `queues_per_thread`) are told about kicks through
-/// [`VringWorker`].
-pub struct VhostUserHandler<T: VhostUserBackend, W: VringWorker> {
+/// [`VringWorker`]. The device `T` is seen only through [`ProtocolBackend`], the methods that
+/// do not depend on which loop it runs on.
+pub struct VhostUserHandler<T: ProtocolBackend<W>, W: VringWorker> {
     backend: T,
     handlers: Vec<Arc<W>>,
     owned: bool,
@@ -129,9 +142,30 @@ where
     }
 }
 
+#[cfg(all(windows, feature = "completion"))]
+impl<T> VhostUserHandler<T, VringCompletionHandler<T>>
+where
+    T: VhostUserCompletionBackend + Clone + 'static,
+    T::Vring: Clone + Send + Sync + 'static,
+    T::Bitmap: Clone + Send + Sync + 'static,
+{
+    /// A handler whose workers are completion-port loops, one `VringCompletionHandler` per
+    /// thread. The device is attached to each thread's port here, before the threads start.
+    pub(crate) fn new_completion(
+        backend: T,
+        atomic_mem: GM<T::Bitmap>,
+    ) -> VhostUserHandlerResult<Self> {
+        let worker_backend = backend.clone();
+        Self::new_with_workers(backend, atomic_mem, |vrings, thread_id| {
+            VringCompletionHandler::new(worker_backend.clone(), vrings, thread_id)
+                .map_err(VhostUserHandlerError::CreateCompletionHandler)
+        })
+    }
+}
+
 impl<T, W> VhostUserHandler<T, W>
 where
-    T: VhostUserBackend + Clone + 'static,
+    T: ProtocolBackend<W> + Clone + 'static,
     T::Vring: Clone + Send + Sync + 'static,
     T::Bitmap: Clone + Send + Sync + 'static,
     W: VringWorker,
@@ -198,7 +232,7 @@ where
     }
 }
 
-impl<T: VhostUserBackend, W: VringWorker> VhostUserHandler<T, W> {
+impl<T: ProtocolBackend<W>, W: VringWorker> VhostUserHandler<T, W> {
     pub(crate) fn send_exit_event(&self) {
         for handler in self.handlers.iter() {
             handler.send_exit_event();
@@ -218,7 +252,7 @@ impl<T: VhostUserBackend, W: VringWorker> VhostUserHandler<T, W> {
 
 impl<T, W> VhostUserHandler<T, W>
 where
-    T: VhostUserBackend,
+    T: ProtocolBackend<W>,
     W: VringWorker,
 {
     /// The workers, in thread order.
@@ -279,7 +313,7 @@ where
     }
 }
 
-impl<T: VhostUserBackend, W: VringWorker> VhostUserBackendReqHandlerMut for VhostUserHandler<T, W>
+impl<T: ProtocolBackend<W>, W: VringWorker> VhostUserBackendReqHandlerMut for VhostUserHandler<T, W>
 where
     T::Bitmap: BitmapReplace + NewBitmap + Clone,
 {
@@ -836,7 +870,7 @@ where
         // Let's create all bitmaps first before replacing them, in case any of them fails
         let mut bitmaps = Vec::new();
         for region in mem.iter() {
-            let bitmap = <<T as VhostUserBackend>::Bitmap as BitmapReplace>::InnerBitmap::new(
+            let bitmap = <<T as ProtocolBackend<W>>::Bitmap as BitmapReplace>::InnerBitmap::new(
                 region,
                 Arc::clone(&logmem),
             )
@@ -853,7 +887,7 @@ where
     }
 }
 
-impl<T: VhostUserBackend, W: VringWorker> Drop for VhostUserHandler<T, W> {
+impl<T: ProtocolBackend<W>, W: VringWorker> Drop for VhostUserHandler<T, W> {
     fn drop(&mut self) {
         // Signal all working threads to exit.
         self.send_exit_event();
@@ -870,6 +904,8 @@ impl<T: VhostUserBackend, W: VringWorker> Drop for VhostUserHandler<T, W> {
 mod tests {
     use super::*;
     use crate::backend::tests::MockVhostBackend;
+    #[cfg(all(windows, feature = "completion"))]
+    use crate::completion_backend::tests::MockCompletionBackend;
     #[cfg(unix)]
     use std::os::fd::IntoRawFd;
     #[cfg(unix)]
@@ -881,15 +917,35 @@ mod tests {
     use std::time::Duration;
     use vhost::vhost_user::message::VhostUserVirtioFeatures;
     use vm_memory::{GuestAddress, GuestMemoryAtomic, GuestMemoryMmap};
-    use vmm_sys_util::event::{new_event_consumer_and_notifier, EventFlag};
+    use vmm_sys_util::event::{new_event_consumer_and_notifier, EventFlag, EventNotifier};
 
-    #[test]
-    fn test_no_lost_kicks() {
-        let mem = GuestMemoryAtomic::new(
+    fn test_mem() -> GuestMemoryAtomic<GuestMemoryMmap<()>> {
+        GuestMemoryAtomic::new(
             GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
-        );
-        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
-        let mut handler = VhostUserHandler::new(backend.clone(), mem.clone()).unwrap();
+        )
+    }
+
+    /// A kick as `set_vring_kick` receives it, and the notifier that fires it.
+    fn new_kick() -> (File, EventNotifier) {
+        let (consumer, notifier) = new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
+        // Safety: we know the consumer is valid.
+        #[cfg(unix)]
+        let file = unsafe { File::from_raw_fd(consumer.into_raw_fd()) };
+        #[cfg(windows)]
+        let file = unsafe { File::from_raw_handle(consumer.into_raw_handle()) };
+        (file, notifier)
+    }
+
+    // The two kick tests below are written against the handler's loop-independent surface
+    // (`ProtocolBackend<W>` and `VringWorker`) so that each loop runs the same test. `events`
+    // reads the device's count of kicks handled.
+
+    fn no_lost_kicks<T, W>(handler: &mut VhostUserHandler<T, W>, events: impl Fn() -> u64)
+    where
+        T: ProtocolBackend<W>,
+        T::Bitmap: BitmapReplace + NewBitmap + Clone,
+        W: VringWorker,
+    {
         handler
             .set_features(VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits())
             .unwrap();
@@ -897,15 +953,9 @@ mod tests {
         // Simulate VMM initializing the vring
         let vring_index = 0;
 
-        let (kick_consumer, notifier) =
-            new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
-        // Safety: we know kick_consumer is valid.
-        #[cfg(unix)]
-        let kick_consumer_file = unsafe { File::from_raw_fd(kick_consumer.into_raw_fd()) };
-        #[cfg(windows)]
-        let kick_consumer_file = unsafe { File::from_raw_handle(kick_consumer.into_raw_handle()) };
+        let (kick, notifier) = new_kick();
         handler
-            .set_vring_kick(vring_index as u8, Some(kick_consumer_file))
+            .set_vring_kick(vring_index as u8, Some(kick))
             .unwrap();
 
         // Ring is NOT enabled yet by default (if protocol features negotiated)
@@ -918,9 +968,9 @@ mod tests {
         // Give it some time to NOT process the event.
         thread::sleep(Duration::from_millis(200));
 
-        let events = backend.lock().unwrap().events();
         assert_eq!(
-            events, 0,
+            events(),
+            0,
             "Backend should NOT have been kicked while disabled"
         );
 
@@ -930,47 +980,39 @@ mod tests {
         // Give it some time to process the NOW-registered event.
         thread::sleep(Duration::from_millis(200));
 
-        let events = backend.lock().unwrap().events();
-        assert_eq!(events, 1, "Backend SHOULD have been kicked after enabling");
+        assert_eq!(
+            events(),
+            1,
+            "Backend SHOULD have been kicked after enabling"
+        );
     }
 
     // Regression test: replacing a live, registered kick descriptor used to drop the old one
     // without unregistering it (UB on Windows, harmless on Linux) and never register the new
     // one, so kicks on the replacement were silently ignored on both platforms.
-    #[test]
-    fn test_replace_live_kick() {
-        let mem = GuestMemoryAtomic::new(
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
-        );
-        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
-        let mut handler = VhostUserHandler::new(backend.clone(), mem.clone()).unwrap();
+    fn replace_live_kick<T, W>(handler: &mut VhostUserHandler<T, W>, events: impl Fn() -> u64)
+    where
+        T: ProtocolBackend<W>,
+        T::Bitmap: BitmapReplace + NewBitmap + Clone,
+        W: VringWorker,
+    {
         handler
             .set_features(VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits())
             .unwrap();
 
         let vring_index = 0;
 
-        let (first_consumer, first_notifier) =
-            new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
-        #[cfg(unix)]
-        let first_file = unsafe { File::from_raw_fd(first_consumer.into_raw_fd()) };
-        #[cfg(windows)]
-        let first_file = unsafe { File::from_raw_handle(first_consumer.into_raw_handle()) };
+        let (first_kick, first_notifier) = new_kick();
         handler
-            .set_vring_kick(vring_index as u8, Some(first_file))
+            .set_vring_kick(vring_index as u8, Some(first_kick))
             .unwrap();
         handler.set_vring_enable(vring_index as u32, true).unwrap();
 
-        // Vring is now ready and enabled, kick descriptor live in the epoll. Replace it — the
+        // Vring is now ready and enabled, kick descriptor live in the loop. Replace it — the
         // scenario the fix above exists for.
-        let (second_consumer, second_notifier) =
-            new_event_consumer_and_notifier(EventFlag::empty()).unwrap();
-        #[cfg(unix)]
-        let second_file = unsafe { File::from_raw_fd(second_consumer.into_raw_fd()) };
-        #[cfg(windows)]
-        let second_file = unsafe { File::from_raw_handle(second_consumer.into_raw_handle()) };
+        let (second_kick, second_notifier) = new_kick();
         handler
-            .set_vring_kick(vring_index as u8, Some(second_file))
+            .set_vring_kick(vring_index as u8, Some(second_kick))
             .unwrap();
 
         // The old notifier no longer reaches anything registered — nothing to assert on that
@@ -980,10 +1022,40 @@ mod tests {
         second_notifier.notify().unwrap();
         thread::sleep(Duration::from_millis(200));
 
-        let events = backend.lock().unwrap().events();
         assert_eq!(
-            events, 1,
+            events(),
+            1,
             "Backend SHOULD have been kicked via the replacement descriptor"
         );
+    }
+
+    #[test]
+    fn test_no_lost_kicks() {
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let mut handler = VhostUserHandler::new(backend.clone(), test_mem()).unwrap();
+        no_lost_kicks(&mut handler, || backend.lock().unwrap().events());
+    }
+
+    #[test]
+    fn test_replace_live_kick() {
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let mut handler = VhostUserHandler::new(backend.clone(), test_mem()).unwrap();
+        replace_live_kick(&mut handler, || backend.lock().unwrap().events());
+    }
+
+    #[cfg(all(windows, feature = "completion"))]
+    #[test]
+    fn test_no_lost_kicks_completion() {
+        let backend = Arc::new(Mutex::new(MockCompletionBackend::new()));
+        let mut handler = VhostUserHandler::new_completion(backend.clone(), test_mem()).unwrap();
+        no_lost_kicks(&mut handler, || backend.lock().unwrap().events());
+    }
+
+    #[cfg(all(windows, feature = "completion"))]
+    #[test]
+    fn test_replace_live_kick_completion() {
+        let backend = Arc::new(Mutex::new(MockCompletionBackend::new()));
+        let mut handler = VhostUserHandler::new_completion(backend.clone(), test_mem()).unwrap();
+        replace_live_kick(&mut handler, || backend.lock().unwrap().events());
     }
 }

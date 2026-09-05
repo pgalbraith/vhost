@@ -22,14 +22,31 @@ use uds_windows::UnixStream;
 use vhost::vhost_user::{BackendListener, BackendReqHandler, Error as VhostUserError, Listener};
 use vm_memory::mmap::NewBitmap;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
+#[cfg(all(windows, feature = "completion"))]
+use vmm_sys_util::completion::Port;
 
 use self::handler::VhostUserHandler;
 
 mod backend;
 pub use self::backend::{VhostUserBackend, VhostUserBackendMut};
 
+#[cfg(all(windows, feature = "completion"))]
+mod completion_backend;
+#[cfg(all(windows, feature = "completion"))]
+pub use self::completion_backend::{VhostUserCompletionBackend, VhostUserCompletionBackendMut};
+
+#[cfg(all(windows, feature = "completion"))]
+mod completion_loop;
+#[cfg(all(windows, feature = "completion"))]
+pub use self::completion_loop::VringCompletionHandler;
+
 mod event_loop;
 pub use self::event_loop::VringEpollHandler;
+
+// Public as a module, not re-exported at the root: a glob import of this crate must not bring
+// the trait's methods into scope beside `VhostUserBackend`'s, which spell the same.
+pub mod protocol;
+use self::protocol::ProtocolBackend;
 
 mod handler;
 pub use self::handler::VhostUserHandlerError;
@@ -126,8 +143,10 @@ impl ShutdownHandle {
 /// a fully functional vhost-user daemon.
 ///
 /// `W` is the loop each vring worker thread runs. The default, [`VringEpollHandler`], is the
-/// epoll loop that [`VhostUserDaemon::new`] builds; see [`VringWorker`].
-pub struct VhostUserDaemon<T: VhostUserBackend, W: VringWorker = VringEpollHandler<T>> {
+/// epoll loop that [`VhostUserDaemon::new`] builds for a [`VhostUserBackend`]; with the
+/// `completion` feature, `new_completion` builds [`VringCompletionHandler`] loops for a
+/// `VhostUserCompletionBackend`. See [`VringWorker`] and [`ProtocolBackend`].
+pub struct VhostUserDaemon<T: ProtocolBackend<W>, W: VringWorker = VringEpollHandler<T>> {
     name: String,
     handler: Arc<Mutex<VhostUserHandler<T, W>>>,
     main_thread: Option<thread::JoinHandle<Result<()>>>,
@@ -172,9 +191,53 @@ where
     }
 }
 
+#[cfg(all(windows, feature = "completion"))]
+impl<T> VhostUserDaemon<T, VringCompletionHandler<T>>
+where
+    T: VhostUserCompletionBackend + Clone + 'static,
+    T::Bitmap: BitmapReplace + NewBitmap + Clone + Send + Sync,
+    T::Vring: Clone + Send + Sync,
+{
+    /// Create the daemon instance for a device that runs on the completion-port loop.
+    ///
+    /// One worker thread per entry of `queues_per_thread` starts here, each waiting on its own
+    /// port. The device is given each port through `attach` before that thread starts, and
+    /// [`get_ports`](Self::get_ports) returns the same ports afterwards.
+    pub fn new_completion(
+        name: String,
+        backend: T,
+        atomic_mem: GuestMemoryAtomic<GuestMemoryMmap<T::Bitmap>>,
+    ) -> Result<Self> {
+        let handler = Arc::new(Mutex::new(
+            VhostUserHandler::new_completion(backend, atomic_mem)
+                .map_err(Error::NewVhostUserHandler)?,
+        ));
+
+        Ok(VhostUserDaemon {
+            name,
+            handler,
+            main_thread: None,
+            conn_state: None,
+        })
+    }
+
+    /// The port each worker thread waits on, in thread order: what `get_epoll_handlers` is to
+    /// the epoll loop.
+    pub fn get_ports(&self) -> Vec<Arc<Port>> {
+        // Do not expect poisoned lock.
+        self.handler
+            .lock()
+            .unwrap()
+            .workers()
+            .iter()
+            .map(|worker| worker.port())
+            .collect()
+    }
+}
+
 impl<T, W> VhostUserDaemon<T, W>
 where
-    T: VhostUserBackend + Clone + 'static,
+    T: ProtocolBackend<W> + Clone + 'static,
     T::Bitmap: BitmapReplace + NewBitmap + Clone + Send + Sync,
     T::Vring: Clone + Send + Sync,
     W: VringWorker,
@@ -336,7 +399,7 @@ where
     }
 }
 
-impl<T: VhostUserBackend, W: VringWorker> Drop for VhostUserDaemon<T, W> {
+impl<T: ProtocolBackend<W>, W: VringWorker> Drop for VhostUserDaemon<T, W> {
     fn drop(&mut self) {
         if let Some(state) = self.conn_state.take() {
             let _ = state.conn.shutdown(Shutdown::Both);
@@ -347,6 +410,8 @@ impl<T: VhostUserBackend, W: VringWorker> Drop for VhostUserDaemon<T, W> {
 #[cfg(test)]
 mod tests {
     use super::backend::tests::MockVhostBackend;
+    #[cfg(all(windows, feature = "completion"))]
+    use super::completion_backend::tests::MockCompletionBackend;
     use super::*;
     #[cfg(unix)]
     use libc::EAGAIN;
@@ -358,17 +423,23 @@ mod tests {
     use uds_windows::{UnixListener, UnixStream};
     use vm_memory::{GuestAddress, GuestMemoryAtomic, GuestMemoryMmap};
 
-    #[test]
-    fn test_new_daemon() {
-        let mem = GuestMemoryAtomic::new(
+    fn test_mem() -> GuestMemoryAtomic<GuestMemoryMmap<()>> {
+        GuestMemoryAtomic::new(
             GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
-        );
-        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
-        let mut daemon = VhostUserDaemon::new("test".to_owned(), backend, mem).unwrap();
+        )
+    }
 
-        let handlers = daemon.get_epoll_handlers();
-        assert_eq!(handlers.len(), 2);
+    // The connection tests below take any daemon, so that each loop runs the same test.
 
+    /// Serve one connection that hangs up at once: `wait` reports the partial message, and a
+    /// second `wait` has nothing to report.
+    fn start_and_wait<T, W>(daemon: &mut VhostUserDaemon<T, W>)
+    where
+        T: ProtocolBackend<W> + Clone + 'static,
+        T::Bitmap: BitmapReplace + NewBitmap + Clone + Send + Sync,
+        T::Vring: Clone + Send + Sync,
+        W: VringWorker,
+    {
         let barrier = Arc::new(Barrier::new(2));
         let tmpdir = tempfile::tempdir().unwrap();
         let path = tmpdir.path().join("socket");
@@ -391,17 +462,14 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_new_daemon_client() {
-        let mem = GuestMemoryAtomic::new(
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
-        );
-        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
-        let mut daemon = VhostUserDaemon::new("test".to_owned(), backend, mem).unwrap();
-
-        let handlers = daemon.get_epoll_handlers();
-        assert_eq!(handlers.len(), 2);
-
+    /// The same as `start_and_wait`, with the daemon connecting out as a client.
+    fn start_client_and_wait<T, W>(daemon: &mut VhostUserDaemon<T, W>)
+    where
+        T: ProtocolBackend<W> + Clone + 'static,
+        T::Bitmap: BitmapReplace + NewBitmap + Clone + Send + Sync,
+        T::Vring: Clone + Send + Sync,
+        W: VringWorker,
+    {
         let barrier = Arc::new(Barrier::new(2));
         let tmpdir = tempfile::tempdir().unwrap();
         let path = tmpdir.path().join("socket");
@@ -426,65 +494,15 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_daemon_serve() {
-        let mem = GuestMemoryAtomic::new(
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
-        );
-        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
-        let mut daemon = VhostUserDaemon::new("test".to_owned(), backend.clone(), mem).unwrap();
-        let tmpdir = tempfile::tempdir().unwrap();
-        let socket_path = tmpdir.path().join("socket");
-
-        thread::scope(|s| {
-            s.spawn(|| {
-                let _ = daemon.serve(&socket_path);
-            });
-
-            // We have no way to wait for when the server becomes available...
-            // So we will have to spin!
-            while !socket_path.exists() {
-                thread::sleep(Duration::from_millis(10));
-            }
-
-            // Check that no exit events got triggered yet.
-            //
-            // Windows' `consume()` is intentionally lossy (see `vmm_sys_util::event`'s Windows
-            // docs) — never blocks, always returns `Ok(())` — so there's no way to observe "not
-            // yet signaled" there like a nonblocking read on an unsignaled Linux eventfd. Only the
-            // positive check below has a Windows equivalent.
-            #[cfg(unix)]
-            for thread_id in 0..backend.queues_per_thread().len() {
-                let fd = backend.exit_event(thread_id).unwrap();
-                // Reading from exit fd should fail since nothing was written yet
-                assert_eq!(
-                    fd.0.consume().unwrap_err().raw_os_error().unwrap(),
-                    EAGAIN,
-                    "exit event should not have been raised yet!"
-                );
-            }
-
-            let socket = UnixStream::connect(&socket_path).unwrap();
-            // disconnect immediately again
-            drop(socket);
-        });
-
-        // Check that exit events got triggered
-        let backend = backend.lock().unwrap();
-        for thread_id in 0..backend.queues_per_thread().len() {
-            let fd = backend.exit_event(thread_id).unwrap();
-            assert!(fd.0.consume().is_ok(), "No exit event was raised!");
-        }
-    }
-
-    #[test]
-    fn test_shutdown_while_connected() {
-        let mem = GuestMemoryAtomic::new(
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
-        );
-        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
-        let mut daemon = VhostUserDaemon::new("test".to_owned(), backend, mem).unwrap();
-
+    /// A shutdown requested while a client is connected makes `wait` return `Ok`, and the daemon
+    /// can then serve another connection.
+    fn shutdown_while_connected<T, W>(daemon: &mut VhostUserDaemon<T, W>)
+    where
+        T: ProtocolBackend<W> + Clone + 'static,
+        T::Bitmap: BitmapReplace + NewBitmap + Clone + Send + Sync,
+        T::Vring: Clone + Send + Sync,
+        W: VringWorker,
+    {
         let barrier = Arc::new(Barrier::new(2));
         let tmpdir = tempfile::tempdir().unwrap();
         let path = tmpdir.path().join("socket");
@@ -528,14 +546,14 @@ mod tests {
         });
     }
 
-    #[test]
-    fn test_double_shutdown() {
-        let mem = GuestMemoryAtomic::new(
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x100000), 0x10000)]).unwrap(),
-        );
-        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
-        let mut daemon = VhostUserDaemon::new("test".to_owned(), backend, mem).unwrap();
-
+    /// Requesting shutdown twice is harmless.
+    fn double_shutdown<T, W>(daemon: &mut VhostUserDaemon<T, W>)
+    where
+        T: ProtocolBackend<W> + Clone + 'static,
+        T::Bitmap: BitmapReplace + NewBitmap + Clone + Send + Sync,
+        T::Vring: Clone + Send + Sync,
+        W: VringWorker,
+    {
         let barrier = Arc::new(Barrier::new(2));
         let tmpdir = tempfile::tempdir().unwrap();
         let path = tmpdir.path().join("socket");
@@ -564,8 +582,175 @@ mod tests {
     }
 
     #[test]
+    fn test_new_daemon() {
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let mut daemon = VhostUserDaemon::new("test".to_owned(), backend, test_mem()).unwrap();
+
+        let handlers = daemon.get_epoll_handlers();
+        assert_eq!(handlers.len(), 2);
+
+        start_and_wait(&mut daemon);
+    }
+
+    #[test]
+    fn test_new_daemon_client() {
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let mut daemon = VhostUserDaemon::new("test".to_owned(), backend, test_mem()).unwrap();
+
+        let handlers = daemon.get_epoll_handlers();
+        assert_eq!(handlers.len(), 2);
+
+        start_client_and_wait(&mut daemon);
+    }
+
+    #[test]
+    fn test_daemon_serve() {
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let mut daemon =
+            VhostUserDaemon::new("test".to_owned(), backend.clone(), test_mem()).unwrap();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let socket_path = tmpdir.path().join("socket");
+
+        thread::scope(|s| {
+            s.spawn(|| {
+                let _ = daemon.serve(&socket_path);
+            });
+
+            // We have no way to wait for when the server becomes available...
+            // So we will have to spin!
+            while !socket_path.exists() {
+                thread::sleep(Duration::from_millis(10));
+            }
+
+            // Check that no exit events got triggered yet.
+            //
+            // Windows' `consume()` is intentionally lossy (see `vmm_sys_util::event`'s Windows
+            // docs) — never blocks, always returns `Ok(())` — so there's no way to observe "not
+            // yet signaled" there like a nonblocking read on an unsignaled Linux eventfd. Only the
+            // positive check below has a Windows equivalent.
+            #[cfg(unix)]
+            for thread_id in 0..VhostUserBackend::queues_per_thread(&backend).len() {
+                let fd = backend.exit_event(thread_id).unwrap();
+                // Reading from exit fd should fail since nothing was written yet
+                assert_eq!(
+                    fd.0.consume().unwrap_err().raw_os_error().unwrap(),
+                    EAGAIN,
+                    "exit event should not have been raised yet!"
+                );
+            }
+
+            let socket = UnixStream::connect(&socket_path).unwrap();
+            // disconnect immediately again
+            drop(socket);
+        });
+
+        // Check that exit events got triggered
+        let backend = backend.lock().unwrap();
+        for thread_id in 0..backend.queues_per_thread().len() {
+            let fd = backend.exit_event(thread_id).unwrap();
+            assert!(fd.0.consume().is_ok(), "No exit event was raised!");
+        }
+    }
+
+    #[test]
+    fn test_shutdown_while_connected() {
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let mut daemon = VhostUserDaemon::new("test".to_owned(), backend, test_mem()).unwrap();
+        shutdown_while_connected(&mut daemon);
+    }
+
+    #[test]
+    fn test_double_shutdown() {
+        let backend = Arc::new(Mutex::new(MockVhostBackend::new()));
+        let mut daemon = VhostUserDaemon::new("test".to_owned(), backend, test_mem()).unwrap();
+        double_shutdown(&mut daemon);
+    }
+
+    #[test]
     fn test_shutdown_handle_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ShutdownHandle>();
+    }
+
+    #[cfg(all(windows, feature = "completion"))]
+    mod completion {
+        use super::*;
+        use std::os::windows::io::AsRawHandle;
+
+        type Backend = Arc<Mutex<MockCompletionBackend>>;
+
+        fn new_daemon() -> (
+            Backend,
+            VhostUserDaemon<Backend, VringCompletionHandler<Backend>>,
+        ) {
+            let backend = Arc::new(Mutex::new(MockCompletionBackend::new()));
+            let daemon =
+                VhostUserDaemon::new_completion("test".to_owned(), backend.clone(), test_mem())
+                    .unwrap();
+            (backend, daemon)
+        }
+
+        #[test]
+        fn test_new_daemon() {
+            let (backend, mut daemon) = new_daemon();
+
+            // One port per worker thread, and the device was attached to exactly those ports.
+            let ports = daemon.get_ports();
+            assert_eq!(ports.len(), 2);
+            let attached = backend.lock().unwrap().ports().to_vec();
+            assert_eq!(attached.len(), 2);
+            for (port, attached) in ports.iter().zip(attached.iter()) {
+                assert_eq!(port.as_raw_handle(), attached.as_raw_handle());
+            }
+
+            start_and_wait(&mut daemon);
+        }
+
+        #[test]
+        fn test_new_daemon_client() {
+            let (_backend, mut daemon) = new_daemon();
+            assert_eq!(daemon.get_ports().len(), 2);
+            start_client_and_wait(&mut daemon);
+        }
+
+        #[test]
+        fn test_daemon_serve() {
+            let (_backend, mut daemon) = new_daemon();
+            let tmpdir = tempfile::tempdir().unwrap();
+            let socket_path = tmpdir.path().join("socket");
+
+            thread::scope(|s| {
+                s.spawn(|| {
+                    let _ = daemon.serve(&socket_path);
+                });
+
+                // We have no way to wait for when the server becomes available...
+                // So we will have to spin!
+                while !socket_path.exists() {
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                let socket = UnixStream::connect(&socket_path).unwrap();
+                // disconnect immediately again
+                drop(socket);
+            });
+
+            // There is no exit event to read on this loop: `serve` posted the exit packet to
+            // every worker's port, and dropping the daemon joins the worker threads, which
+            // returns only if each loop saw its packet. A hang here is the failure.
+            drop(daemon);
+        }
+
+        #[test]
+        fn test_shutdown_while_connected() {
+            let (_backend, mut daemon) = new_daemon();
+            shutdown_while_connected(&mut daemon);
+        }
+
+        #[test]
+        fn test_double_shutdown() {
+            let (_backend, mut daemon) = new_daemon();
+            double_shutdown(&mut daemon);
+        }
     }
 }

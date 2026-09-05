@@ -4,8 +4,15 @@
 
 ### Added
 - [[#PR]] Port to Windows.
+- [[#PR]] Add a vring loop over an I/O completion port (`VringCompletionHandler`) and the device
+  traits that run on it (`VhostUserCompletionBackend`, `VhostUserCompletionBackendMut`), with
+  `VhostUserDaemon::new_completion` and `get_ports`. Windows only, behind the `completion` feature.
 
 ### Changed
+- [[#PR]] `VhostUserDaemon` takes the vring loop as a second, defaulted type parameter
+  (`VringWorker`), and the control channel sees a device through `protocol::ProtocolBackend<W>`.
+  Existing code that names `VhostUserDaemon<T>` or implements `VhostUserBackend` is unaffected.
+
 ### Deprecated
 ### Fixed
 - [[#PR]] Fix `set_vring_kick` dropping a live kick descriptor without unregistering it, and

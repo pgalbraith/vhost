@@ -15,6 +15,11 @@ rustc-args = ["--cfg", "RUSTDOC_disable_feature_compat_errors"]
 [features]
 xen = ["vm-memory/xen", "vhost/xen"]
 postcopy = ["vhost/postcopy", "userfaultfd"]
+# The completion-port vring loop and the device trait that runs on it
+# (VringCompletionHandler, VhostUserCompletionBackend). Windows only:
+# vmm-sys-util compiles its completion module only there, so on other hosts
+# the feature is inert and nothing is exported under it.
+completion = ["vmm-sys-util/completion"]
 
 [dependencies]
 libc = "0.2.39"
