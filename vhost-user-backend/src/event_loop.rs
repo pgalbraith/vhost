@@ -19,6 +19,7 @@ use vmm_sys_util::event::{EventConsumer, EventNotifier};
 
 use super::backend::VhostUserBackend;
 use super::vring::VringT;
+use super::worker::VringWorker;
 
 /// A raw handle on an event source that can be registered with the epoll: a file descriptor on
 /// unix, a `HANDLE` on Windows. The same platform split as everything else vhost hands around,
@@ -26,7 +27,7 @@ use super::vring::VringT;
 pub use vhost::RawDescriptor;
 
 /// Borrow `consumer`'s raw descriptor, for registering or unregistering it with the epoll.
-pub(crate) fn raw_descriptor(consumer: &EventConsumer) -> RawDescriptor {
+fn raw_descriptor(consumer: &EventConsumer) -> RawDescriptor {
     #[cfg(unix)]
     return consumer.as_raw_fd();
     #[cfg(windows)]
@@ -305,6 +306,32 @@ where
             .map_err(VringEpollError::HandleEventBackendHandling)?;
 
         Ok(false)
+    }
+}
+
+/// The epoll loop as the control channel drives it: a kick is an `IN` registration under its
+/// per-worker index, and the loop's own `run` and `send_exit_event` are the trait's.
+impl<T> VringWorker for VringEpollHandler<T>
+where
+    T: VhostUserBackend + 'static,
+    T::Vring: Send + Sync,
+    T::Bitmap: Send + Sync,
+{
+    fn register_kick(&self, kick: &EventConsumer, index: u64) -> Result<()> {
+        self.register_event(raw_descriptor(kick), EventSet::IN, index)
+    }
+
+    fn unregister_kick(&self, kick: &EventConsumer, index: u64) -> Result<()> {
+        self.unregister_event(raw_descriptor(kick), EventSet::IN, index)
+    }
+
+    fn run(&self) -> Result<()> {
+        // The inherent `run` above, with its epoll-specific error wrapped.
+        VringEpollHandler::run(self).map_err(io::Error::other)
+    }
+
+    fn send_exit_event(&self) {
+        VringEpollHandler::send_exit_event(self)
     }
 }
 

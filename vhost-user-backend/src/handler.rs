@@ -34,13 +34,12 @@ use vm_memory::mmap::NewBitmap;
 use vm_memory::{
     GuestAddress, GuestAddressSpace, GuestMemoryBackend, GuestMemoryMmap, GuestRegionMmap,
 };
-use vmm_sys_util::epoll::EventSet;
 
 use super::backend::VhostUserBackend;
-use super::event_loop::raw_descriptor;
+use super::event_loop::VringEpollError;
 use super::event_loop::VringEpollHandler;
-use super::event_loop::{VringEpollError, VringEpollResult};
 use super::vring::VringT;
+use super::worker::VringWorker;
 use super::GM;
 
 // vhost in the kernel usually supports 509 mem slots.
@@ -92,9 +91,12 @@ struct AddrMapping {
     gpa_base: u64,
 }
 
-pub struct VhostUserHandler<T: VhostUserBackend> {
+/// The control-channel side of a daemon: every vhost-user request lands here, and the vring
+/// workers (`W`, one per entry of `queues_per_thread`) are told about kicks through
+/// [`VringWorker`].
+pub struct VhostUserHandler<T: VhostUserBackend, W: VringWorker> {
     backend: T,
-    handlers: Vec<Arc<VringEpollHandler<T>>>,
+    handlers: Vec<Arc<W>>,
     owned: bool,
     features_acked: bool,
     acked_features: u64,
@@ -107,17 +109,43 @@ pub struct VhostUserHandler<T: VhostUserBackend> {
     vrings: Vec<T::Vring>,
     #[cfg(feature = "postcopy")]
     uffd: Option<Uffd>,
-    worker_threads: Vec<thread::JoinHandle<VringEpollResult<()>>>,
+    worker_threads: Vec<thread::JoinHandle<io::Result<()>>>,
 }
 
 // Ensure VhostUserHandler: Clone + Send + Sync + 'static.
-impl<T> VhostUserHandler<T>
+impl<T> VhostUserHandler<T, VringEpollHandler<T>>
 where
     T: VhostUserBackend + Clone + 'static,
     T::Vring: Clone + Send + Sync + 'static,
     T::Bitmap: Clone + Send + Sync + 'static,
 {
+    /// A handler whose workers are epoll loops, one `VringEpollHandler` per thread.
     pub(crate) fn new(backend: T, atomic_mem: GM<T::Bitmap>) -> VhostUserHandlerResult<Self> {
+        let worker_backend = backend.clone();
+        Self::new_with_workers(backend, atomic_mem, |vrings, thread_id| {
+            VringEpollHandler::new(worker_backend.clone(), vrings, thread_id)
+                .map_err(VhostUserHandlerError::CreateEpollHandler)
+        })
+    }
+}
+
+impl<T, W> VhostUserHandler<T, W>
+where
+    T: VhostUserBackend + Clone + 'static,
+    T::Vring: Clone + Send + Sync + 'static,
+    T::Bitmap: Clone + Send + Sync + 'static,
+    W: VringWorker,
+{
+    /// Create the vrings, build one worker per entry of `queues_per_thread` with `new_worker`
+    /// (given that thread's vrings and its index), and start a thread running each worker.
+    pub(crate) fn new_with_workers<F>(
+        backend: T,
+        atomic_mem: GM<T::Bitmap>,
+        mut new_worker: F,
+    ) -> VhostUserHandlerResult<Self>
+    where
+        F: FnMut(Vec<T::Vring>, usize) -> VhostUserHandlerResult<W>,
+    {
         let num_queues = backend.num_queues();
         let max_queue_size = backend.max_queue_size();
         let queues_per_thread = backend.queues_per_thread();
@@ -139,10 +167,7 @@ where
                 }
             }
 
-            let handler = Arc::new(
-                VringEpollHandler::new(backend.clone(), thread_vrings, thread_id)
-                    .map_err(VhostUserHandlerError::CreateEpollHandler)?,
-            );
+            let handler = Arc::new(new_worker(thread_vrings, thread_id)?);
             let handler2 = handler.clone();
             let worker_thread = thread::Builder::new()
                 .name("vring_worker".to_string())
@@ -173,7 +198,7 @@ where
     }
 }
 
-impl<T: VhostUserBackend> VhostUserHandler<T> {
+impl<T: VhostUserBackend, W: VringWorker> VhostUserHandler<T, W> {
     pub(crate) fn send_exit_event(&self) {
         for handler in self.handlers.iter() {
             handler.send_exit_event();
@@ -191,11 +216,13 @@ impl<T: VhostUserBackend> VhostUserHandler<T> {
     }
 }
 
-impl<T> VhostUserHandler<T>
+impl<T, W> VhostUserHandler<T, W>
 where
     T: VhostUserBackend,
+    W: VringWorker,
 {
-    pub(crate) fn get_epoll_handlers(&self) -> Vec<Arc<VringEpollHandler<T>>> {
+    /// The workers, in thread order.
+    pub(crate) fn workers(&self) -> Vec<Arc<W>> {
         self.handlers.clone()
     }
 
@@ -223,11 +250,9 @@ where
                 if shifted_queues_mask & 1u64 == 1u64 {
                     let evt_idx = queues_mask.count_ones() - shifted_queues_mask.count_ones();
                     if vring_state.get_queue().ready() && vring_state.is_enabled() {
-                        if let Err(e) = self.handlers[thread_index].register_event(
-                            raw_descriptor(fd),
-                            EventSet::IN,
-                            u64::from(evt_idx),
-                        ) {
+                        if let Err(e) =
+                            self.handlers[thread_index].register_kick(fd, u64::from(evt_idx))
+                        {
                             if e.kind() != io::ErrorKind::AlreadyExists {
                                 // This could happen if we're asked by the frontend to enable an
                                 // already enabled queue, don't fail in that case.
@@ -235,11 +260,7 @@ where
                             }
                         }
                     } else {
-                        let _ = self.handlers[thread_index].unregister_event(
-                            raw_descriptor(fd),
-                            EventSet::IN,
-                            u64::from(evt_idx),
-                        );
+                        let _ = self.handlers[thread_index].unregister_kick(fd, u64::from(evt_idx));
                     }
                     break;
                 }
@@ -258,7 +279,7 @@ where
     }
 }
 
-impl<T: VhostUserBackend> VhostUserBackendReqHandlerMut for VhostUserHandler<T>
+impl<T: VhostUserBackend, W: VringWorker> VhostUserBackendReqHandlerMut for VhostUserHandler<T, W>
 where
     T::Bitmap: BitmapReplace + NewBitmap + Clone,
 {
@@ -483,16 +504,12 @@ where
         // but undefined behavior on Windows, where a registered handle must be unregistered
         // before it's closed (see `vmm_sys_util::epoll::Epoll::ctl` docs).
         if let Some(old_kick) = vring.get_ref().get_kick() {
-            let old_raw = raw_descriptor(old_kick);
             for (thread_index, queues_mask) in self.queues_per_thread.iter().enumerate() {
                 let shifted_queues_mask = queues_mask >> index;
                 if shifted_queues_mask & 1u64 == 1u64 {
                     let evt_idx = queues_mask.count_ones() - shifted_queues_mask.count_ones();
-                    let _ = self.handlers[thread_index].unregister_event(
-                        old_raw,
-                        EventSet::IN,
-                        u64::from(evt_idx),
-                    );
+                    let _ =
+                        self.handlers[thread_index].unregister_kick(old_kick, u64::from(evt_idx));
                     break;
                 }
             }
@@ -836,7 +853,7 @@ where
     }
 }
 
-impl<T: VhostUserBackend> Drop for VhostUserHandler<T> {
+impl<T: VhostUserBackend, W: VringWorker> Drop for VhostUserHandler<T, W> {
     fn drop(&mut self) {
         // Signal all working threads to exit.
         self.send_exit_event();

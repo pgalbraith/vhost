@@ -42,6 +42,9 @@ pub use self::vring::{
     VringMutex, VringRwLock, VringState, VringStateGuard, VringStateMutGuard, VringT,
 };
 
+mod worker;
+pub use self::worker::VringWorker;
+
 // Due to the way `xen` handles memory mappings we can not combine it with
 // `postcopy` feature which relies on persistent memory mappings. Thus we
 // disallow enabling both features at the same time.
@@ -121,14 +124,17 @@ impl ShutdownHandle {
 ///
 /// This structure is the public API the backend is allowed to interact with in order to run
 /// a fully functional vhost-user daemon.
-pub struct VhostUserDaemon<T: VhostUserBackend> {
+///
+/// `W` is the loop each vring worker thread runs. The default, [`VringEpollHandler`], is the
+/// epoll loop that [`VhostUserDaemon::new`] builds; see [`VringWorker`].
+pub struct VhostUserDaemon<T: VhostUserBackend, W: VringWorker = VringEpollHandler<T>> {
     name: String,
-    handler: Arc<Mutex<VhostUserHandler<T>>>,
+    handler: Arc<Mutex<VhostUserHandler<T, W>>>,
     main_thread: Option<thread::JoinHandle<Result<()>>>,
     conn_state: Option<Arc<ConnectionState>>,
 }
 
-impl<T> VhostUserDaemon<T>
+impl<T> VhostUserDaemon<T, VringEpollHandler<T>>
 where
     T: VhostUserBackend + Clone + 'static,
     T::Bitmap: BitmapReplace + NewBitmap + Clone + Send + Sync,
@@ -156,6 +162,23 @@ where
         })
     }
 
+    /// Retrieve the vring epoll handler.
+    ///
+    /// This is necessary to perform further actions like registering and unregistering some extra
+    /// event file descriptors.
+    pub fn get_epoll_handlers(&self) -> Vec<Arc<VringEpollHandler<T>>> {
+        // Do not expect poisoned lock.
+        self.handler.lock().unwrap().workers()
+    }
+}
+
+impl<T, W> VhostUserDaemon<T, W>
+where
+    T: VhostUserBackend + Clone + 'static,
+    T::Bitmap: BitmapReplace + NewBitmap + Clone + Send + Sync,
+    T::Vring: Clone + Send + Sync,
+    W: VringWorker,
+{
     fn reset_connection_state(&mut self) {
         self.conn_state = None;
     }
@@ -169,7 +192,7 @@ where
     /// it acts as a client or a server.
     fn start_daemon(
         &mut self,
-        mut handler: BackendReqHandler<Mutex<VhostUserHandler<T>>>,
+        mut handler: BackendReqHandler<Mutex<VhostUserHandler<T, W>>>,
     ) -> Result<()> {
         let state = Arc::new(ConnectionState {
             conn: handler.try_clone_connection().map_err(Error::StartDaemon)?,
@@ -223,8 +246,8 @@ where
 
     fn accept(
         &self,
-        backend_listener: &mut BackendListener<Mutex<VhostUserHandler<T>>>,
-    ) -> Result<BackendReqHandler<Mutex<VhostUserHandler<T>>>> {
+        backend_listener: &mut BackendListener<Mutex<VhostUserHandler<T, W>>>,
+    ) -> Result<BackendReqHandler<Mutex<VhostUserHandler<T, W>>>> {
         loop {
             match backend_listener.accept() {
                 Err(e) => return Err(Error::CreateBackendListener(e)),
@@ -311,18 +334,9 @@ where
             _ => result,
         }
     }
-
-    /// Retrieve the vring epoll handler.
-    ///
-    /// This is necessary to perform further actions like registering and unregistering some extra
-    /// event file descriptors.
-    pub fn get_epoll_handlers(&self) -> Vec<Arc<VringEpollHandler<T>>> {
-        // Do not expect poisoned lock.
-        self.handler.lock().unwrap().get_epoll_handlers()
-    }
 }
 
-impl<T: VhostUserBackend> Drop for VhostUserDaemon<T> {
+impl<T: VhostUserBackend, W: VringWorker> Drop for VhostUserDaemon<T, W> {
     fn drop(&mut self) {
         if let Some(state) = self.conn_state.take() {
             let _ = state.conn.shutdown(Shutdown::Both);
